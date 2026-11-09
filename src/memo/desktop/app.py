@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
 import hashlib
 import json
 import logging
@@ -600,9 +601,16 @@ class MemoApp(wx.App):
         self._config_timer.Start(1000)
 
     def new_note_dialog(self) -> None:
-        dlg = wx.TextEntryDialog(None, "slug (英小文字・数字・ハイフン)", "新規メモ")
+        prefix = datetime.date.today().strftime("%y%m%d") + "-"
+        dlg = wx.TextEntryDialog(None, "slug (英小文字・数字・ハイフン)", "新規メモ", prefix)
+        text = next((c for c in dlg.GetChildren() if isinstance(c, wx.TextCtrl)), None)
         try:
-            while dlg.ShowModal() == wx.ID_OK:
+            while True:
+                # 既定では全選択されるので、表示後にカーソルを末尾へ移す
+                if text:
+                    wx.CallAfter(text.SetInsertionPointEnd)
+                if dlg.ShowModal() != wx.ID_OK:
+                    break
                 slug = dlg.GetValue().strip().lower()
                 try:
                     validate_slug(slug)
