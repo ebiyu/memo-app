@@ -24,6 +24,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # ウィンドウを作る前にやる必要がある (拡大表示でのぼけ防止)
+    from .dpi import enable_dpi_awareness
+    enable_dpi_awareness()
+
     from .app import MemoApp
 
     app = MemoApp(args.data_dir, args.server, args.interval, args.token)

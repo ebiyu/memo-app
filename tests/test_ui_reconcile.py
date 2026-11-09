@@ -30,7 +30,7 @@ class FakeApp:
     def request(self):
         self.requests += 1
 
-    def next_cascade_pos(self):
+    def next_cascade_pos(self, win):
         return wx.Point(0, 0)
 
     def remember_rect(self, frame):

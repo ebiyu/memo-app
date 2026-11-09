@@ -20,6 +20,7 @@ import wx.adv
 
 from memo.core import InvalidSlug, has_conflict_markers, merge3way, validate_slug
 
+from .dpi import scale_factor
 from .store import LocalStore
 from .sync import BackgroundSync, SyncEngine, SyncReport
 
@@ -27,7 +28,10 @@ log = logging.getLogger(__name__)
 
 NOTE_BG = wx.Colour(255, 248, 196)
 CONFLICT_BG = wx.Colour(255, 214, 214)
-DEFAULT_SIZE = (240, 180)
+DEFAULT_SIZE = (240, 180)  # DIP
+MIN_SIZE = (120, 60)  # DIP
+CASCADE_MARGIN = 40  # DIP
+CASCADE_STEP = 24  # DIP
 SAVE_DELAY_MS = 700
 # 編集中の付箋が非アクティブになってから、手元の変更を自動 push するまでの時間
 INACTIVE_PUSH_DELAY_MS = 5 * 60 * 1000
@@ -47,18 +51,27 @@ class ThinScrollBar(wx.Window):
     普段は細い線、ホバー・ドラッグ中は少し太くなる。
     """
 
+    # DIP (96 DPI 基準)。実際の描画には __init__ で実 px に変換したものを使う
     WIDTH = 10
     THIN, THICK = 3, 6
     MIN_THUMB = 16
+    PAD = 2
     EM_GETFIRSTVISIBLELINE = 0x00CE
     EM_LINESCROLL = 0x00B6
 
     def __init__(self, parent: wx.Window, target: wx.TextCtrl):
-        super().__init__(parent, size=(self.WIDTH, -1), style=wx.BORDER_NONE)
+        cls = ThinScrollBar
+        width = parent.FromDIP(cls.WIDTH)
+        super().__init__(parent, size=(width, -1), style=wx.BORDER_NONE)
+        self.width = width
+        self.thin = self.FromDIP(cls.THIN)
+        self.thick = self.FromDIP(cls.THICK)
+        self.min_thumb = self.FromDIP(cls.MIN_THUMB)
+        self.pad = self.FromDIP(cls.PAD)
         self.target = target
         self._hide_native_scrollbar()
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
-        self.SetMinSize((self.WIDTH, -1))
+        self.SetMinSize((width, -1))
         self._state: tuple[int, int, int] = (0, 0, 0)  # (first, visible, total)
         self._hover = False
         self._wheel_acc = 0
@@ -121,7 +134,7 @@ class ThinScrollBar(wx.Window):
         if total <= visible:
             return None
         h = self.GetClientSize().height
-        thumb_h = max(h * visible // total, self.MIN_THUMB)
+        thumb_h = max(h * visible // total, self.min_thumb)
         max_first = total - visible
         top = (h - thumb_h) * min(first, max_first) // max_first
         return top, thumb_h
@@ -135,13 +148,13 @@ class ThinScrollBar(wx.Window):
             return
         top, thumb_h = thumb
         active = self._hover or self._drag is not None
-        w = self.THICK if active else self.THIN
+        w = self.thick if active else self.thin
         alpha = 150 if active else 100
-        x = (self.WIDTH - w) // 2
+        x = (self.width - w) // 2
         gc = wx.GraphicsContext.Create(dc)
         gc.SetPen(wx.TRANSPARENT_PEN)
         gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, alpha)))
-        gc.DrawRoundedRectangle(x, top + 2, w, thumb_h - 4, w / 2)
+        gc.DrawRoundedRectangle(x, top + self.pad, w, thumb_h - 2 * self.pad, w / 2)
 
     def _set_hover(self, hover: bool) -> None:
         self._hover = hover
@@ -216,6 +229,26 @@ class Config:
         self.data.setdefault("windows", {})
         self.data.setdefault("open", [])
         self.data.setdefault("not_on_top", [])  # 最前面を解除した slug
+        self._migrate_dpi()
+
+    def _migrate_dpi(self) -> None:
+        """DPI 非対応だった頃に保存した矩形を実座標へ引き伸ばす (1 回だけ)。
+
+        当時の GetRect() は 96 DPI 換算の仮想座標を返していたので、そのまま
+        SetRect() すると拡大環境で付箋が拡大率ぶん小さくなってしまう。
+        """
+        if self.data.get("dpi_migration") == 1:
+            return
+        self.data["dpi_migration"] = 1
+        scale = scale_factor()
+        if scale == 1.0 or not self.data["windows"]:
+            return
+        self.data["windows"] = {
+            slug: [round(v * scale) for v in rect]
+            for slug, rect in self.data["windows"].items()
+        }
+        log.info("rescaled %d window rects by %.2f for DPI awareness",
+                 len(self.data["windows"]), scale)
 
     def save(self) -> None:
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -252,7 +285,7 @@ class NoteFrame(wx.Frame):
         super().__init__(None, title=slug, style=style)
         self.app = app
         self.slug = slug
-        self.SetMinSize((120, 60))
+        self.SetMinSize(self.FromDIP(wx.Size(*MIN_SIZE)))
 
         self.text = wx.TextCtrl(
             self, style=wx.TE_MULTILINE | wx.TE_NOHIDESEL | wx.BORDER_NONE)
@@ -275,8 +308,8 @@ class NoteFrame(wx.Frame):
         if rect:
             self.SetRect(wx.Rect(*rect))
         else:
-            self.SetSize(DEFAULT_SIZE)
-            self.SetPosition(app.next_cascade_pos())
+            self.SetSize(self.FromDIP(wx.Size(*DEFAULT_SIZE)))
+            self.SetPosition(app.next_cascade_pos(self))
 
         self.text.Bind(wx.EVT_TEXT, self._on_text)
         self.text.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
@@ -578,11 +611,13 @@ class MemoApp(wx.App):
             )
 
     # --- ウィンドウ管理 ---
-    def next_cascade_pos(self) -> wx.Point:
+    def next_cascade_pos(self, win: wx.Window) -> wx.Point:
         area = wx.Display(0).GetClientArea()
         self._cascade = (self._cascade + 1) % 10
-        off = 24 * self._cascade
-        return wx.Point(area.right - DEFAULT_SIZE[0] - 40 - off, area.top + 40 + off)
+        off = win.FromDIP(CASCADE_STEP) * self._cascade
+        margin = win.FromDIP(CASCADE_MARGIN)
+        width = win.FromDIP(DEFAULT_SIZE[0])
+        return wx.Point(area.right - width - margin - off, area.top + margin + off)
 
     def open_note(self, slug: str, create: bool = False) -> None:
         if slug in self.frames:
