@@ -279,6 +279,7 @@ class NoteFrame(wx.Frame):
             self.SetPosition(app.next_cascade_pos())
 
         self.text.Bind(wx.EVT_TEXT, self._on_text)
+        self.text.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_ACTIVATE, self._on_activate)
         self.Bind(wx.EVT_MOVE_END, lambda e: (app.remember_rect(self), e.Skip()))
@@ -297,6 +298,56 @@ class NoteFrame(wx.Frame):
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_DELETE, ids["delete"]),
             (wx.ACCEL_CTRL, ord("S"), ids["sync"]),
         ]))
+
+    # --- 選択なしの Ctrl+C / Ctrl+X で行ごとコピー・カット ---
+    def _on_key_down(self, evt: wx.KeyEvent) -> None:
+        key = evt.GetKeyCode()
+        if evt.GetModifiers() == wx.MOD_CONTROL and key in (ord("C"), ord("X")):
+            start, end = self.text.GetSelection()
+            if start == end:
+                self._copy_line(cut=key == ord("X"))
+                return
+        evt.Skip()
+
+    def _copy_line(self, cut: bool) -> None:
+        """カーソルのある論理行 (折り返しではなく改行区切り) を改行付きでコピーする。"""
+        value = self.text.GetValue()
+        # MSW の EDIT は位置を CRLF 2 文字で数えるので、GetValue() の添字と相互変換する
+        crlf = self.text.GetLastPosition() != len(value)
+
+        def to_index(pos: int) -> int:
+            if not crlf:
+                return pos
+            return len(value.replace("\n", "\r\n")[:pos].replace("\r\n", "\n"))
+
+        def to_pos(text: str, idx: int) -> int:
+            return idx + text.count("\n", 0, idx) if crlf else idx
+
+        idx = to_index(self.text.GetInsertionPoint())
+        s = value.rfind("\n", 0, idx) + 1
+        e = value.find("\n", idx)
+        if e == -1:
+            e = len(value)
+        if wx.TheClipboard.Open():
+            try:
+                wx.TheClipboard.SetData(wx.TextDataObject(value[s:e] + "\n"))
+            finally:
+                wx.TheClipboard.Close()
+        if not cut:
+            return
+        if e < len(value):
+            rs, re_ = s, e + 1  # 行末の改行ごと消す -> カーソルは次の行頭
+            target = s
+        elif s > 0:
+            rs, re_ = s - 1, e  # 最終行は直前の改行ごと消す -> カーソルは新しい最終行の行頭
+            target = value.rfind("\n", 0, s - 1) + 1
+        else:
+            rs, re_ = s, e  # 1 行だけのとき
+            target = 0
+        if rs == re_:
+            return
+        self.text.Remove(to_pos(value, rs), to_pos(value, re_))
+        self.text.SetInsertionPoint(to_pos(self.text.GetValue(), target))
 
     # --- 保存とローカル変更の取り込み ---
     def _on_text(self, _evt) -> None:
