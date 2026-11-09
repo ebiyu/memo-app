@@ -604,6 +604,12 @@ class MemoApp(wx.App):
         prefix = datetime.date.today().strftime("%y%m%d") + "-"
         dlg = wx.TextEntryDialog(None, "slug (英小文字・数字・ハイフン)", "新規メモ", prefix)
         text = next((c for c in dlg.GetChildren() if isinstance(c, wx.TextCtrl)), None)
+        if text:
+            # slug は ASCII のみなので IME を切り離す (半角のまま打てるように)
+            imm = ctypes.windll.imm32
+            imm.ImmAssociateContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            imm.ImmAssociateContext.restype = ctypes.c_void_p
+            imm.ImmAssociateContext(text.GetHandle(), None)
         try:
             while True:
                 # 既定では全選択されるので、表示後にカーソルを末尾へ移す
