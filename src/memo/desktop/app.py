@@ -1,8 +1,6 @@
 """付箋 UI (wxPython)。
 
-- メモ 1 つ = 小さなウィンドウ 1 枚
-  - 最前面のとき: ツールウィンドウ (タスクバー・Alt+Tab に出さない)
-  - 最前面でないとき: 通常ウィンドウ (タスクバー・Alt+Tab に出す)
+- メモ 1 つ = 小さな通常ウィンドウ 1 枚 (最前面の有無にかかわらずタスクバー・Alt+Tab に出す)
 - 入力欄は Win32 の素の EDIT コントロール。書式は一切持たない
 - タスクトレイに常駐。メニューから新規作成・開く・同期・終了
 """
@@ -235,10 +233,10 @@ def make_icon() -> wx.Icon:
 
 
 class NoteFrame(wx.Frame):
-    # wx.FRAME_NO_TASKBAR は使わない。付けると隠しオーナー付きで作られ、
-    # 後からツールウィンドウを外しても Alt+Tab に出なくなる。
+    # タスクバー・Alt+Tab に出すため wx.FRAME_TOOL_WINDOW / wx.FRAME_NO_TASKBAR は使わない
+    # (後者は隠しオーナー付きで作られ、Alt+Tab に出なくなる)。
     BASE_STYLE = wx.CAPTION | wx.CLOSE_BOX | wx.RESIZE_BORDER
-    ON_TOP_STYLE = wx.FRAME_TOOL_WINDOW | wx.STAY_ON_TOP
+    ON_TOP_STYLE = wx.STAY_ON_TOP
 
     def __init__(self, app: "MemoApp", slug: str, rect: list[int] | None, on_top: bool = True):
         style = self.BASE_STYLE | (self.ON_TOP_STYLE if on_top else 0)
@@ -393,16 +391,7 @@ class NoteFrame(wx.Frame):
     def set_on_top(self, on_top: bool) -> None:
         style = self.GetWindowStyleFlag()
         style = style | self.ON_TOP_STYLE if on_top else style & ~self.ON_TOP_STYLE
-        rect = self.GetRect()
-        shown = self.IsShown()
-        # タスクバー / Alt+Tab への登録を変えるには一度隠す必要がある
-        if shown:
-            self.Hide()
         self.SetWindowStyleFlag(style)
-        self.SetRect(rect)
-        if shown:
-            self.Show()
-            self.Raise()
         self.app.remember_on_top(self.slug, on_top)
 
     def refresh_look(self) -> None:

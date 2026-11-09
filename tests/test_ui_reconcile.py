@@ -133,7 +133,7 @@ def test_unsynced_marker(frame):
     assert frame.GetTitle() == "● m"
 
 
-def test_not_on_top_window_is_normal_app_window(frame):
+def test_note_is_normal_app_window_regardless_of_on_top(frame):
     import ctypes
 
     u = ctypes.windll.user32
@@ -142,7 +142,7 @@ def test_not_on_top_window_is_normal_app_window(frame):
     WS_EX_TOPMOST, WS_EX_TOOLWINDOW = 0x8, 0x80
 
     frame.Show()
-    assert frame.on_top and ex() & WS_EX_TOOLWINDOW and ex() & WS_EX_TOPMOST
+    assert frame.on_top and ex() & WS_EX_TOPMOST and not ex() & WS_EX_TOOLWINDOW
     assert u.GetWindow(frame.GetHandle(), 4) == 0  # GW_OWNER: オーナーなし
 
     frame.toggle_on_top()
@@ -151,4 +151,4 @@ def test_not_on_top_window_is_normal_app_window(frame):
     assert frame.app.on_top == ("m", False)
 
     frame.toggle_on_top()
-    assert frame.on_top and ex() & WS_EX_TOOLWINDOW
+    assert frame.on_top and ex() & WS_EX_TOPMOST and not ex() & WS_EX_TOOLWINDOW
