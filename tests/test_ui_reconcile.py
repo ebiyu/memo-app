@@ -36,6 +36,9 @@ class FakeApp:
     def remember_rect(self, frame):
         pass
 
+    def remember_on_top(self, slug, on_top):
+        self.on_top = (slug, on_top)
+
     def close_note(self, slug):
         self.closed.append(slug)
 
@@ -128,3 +131,24 @@ def test_unsynced_marker(frame):
     assert frame.GetTitle() == "m"
     frame.text.SetValue("changed")
     assert frame.GetTitle() == "● m"
+
+
+def test_not_on_top_window_is_normal_app_window(frame):
+    import ctypes
+
+    u = ctypes.windll.user32
+    u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    ex = lambda: u.GetWindowLongPtrW(frame.GetHandle(), -20)  # GWL_EXSTYLE
+    WS_EX_TOPMOST, WS_EX_TOOLWINDOW = 0x8, 0x80
+
+    frame.Show()
+    assert frame.on_top and ex() & WS_EX_TOOLWINDOW and ex() & WS_EX_TOPMOST
+    assert u.GetWindow(frame.GetHandle(), 4) == 0  # GW_OWNER: オーナーなし
+
+    frame.toggle_on_top()
+    assert not frame.on_top
+    assert not ex() & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
+    assert frame.app.on_top == ("m", False)
+
+    frame.toggle_on_top()
+    assert frame.on_top and ex() & WS_EX_TOOLWINDOW

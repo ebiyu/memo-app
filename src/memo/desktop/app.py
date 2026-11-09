@@ -1,6 +1,8 @@
 """付箋 UI (wxPython)。
 
-- メモ 1 つ = 小さなツールウィンドウ 1 枚 (常に最前面、タスクバーに出さない)
+- メモ 1 つ = 小さなウィンドウ 1 枚
+  - 最前面のとき: ツールウィンドウ (タスクバー・Alt+Tab に出さない)
+  - 最前面でないとき: 通常ウィンドウ (タスクバー・Alt+Tab に出す)
 - 入力欄は Win32 の素の EDIT コントロール。書式は一切持たない
 - タスクトレイに常駐。メニューから新規作成・開く・同期・終了
 """
@@ -42,6 +44,7 @@ class Config:
                 log.exception("failed to read config")
         self.data.setdefault("windows", {})
         self.data.setdefault("open", [])
+        self.data.setdefault("not_on_top", [])  # 最前面を解除した slug
 
     def save(self) -> None:
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -68,17 +71,14 @@ def make_icon() -> wx.Icon:
 
 
 class NoteFrame(wx.Frame):
-    STYLE = (
-        wx.CAPTION
-        | wx.CLOSE_BOX
-        | wx.RESIZE_BORDER
-        | wx.FRAME_TOOL_WINDOW
-        | wx.FRAME_NO_TASKBAR
-        | wx.STAY_ON_TOP
-    )
+    # wx.FRAME_NO_TASKBAR は使わない。付けると隠しオーナー付きで作られ、
+    # 後からツールウィンドウを外しても Alt+Tab に出なくなる。
+    BASE_STYLE = wx.CAPTION | wx.CLOSE_BOX | wx.RESIZE_BORDER
+    ON_TOP_STYLE = wx.FRAME_TOOL_WINDOW | wx.STAY_ON_TOP
 
-    def __init__(self, app: "MemoApp", slug: str, rect: list[int] | None):
-        super().__init__(None, title=slug, style=self.STYLE)
+    def __init__(self, app: "MemoApp", slug: str, rect: list[int] | None, on_top: bool = True):
+        style = self.BASE_STYLE | (self.ON_TOP_STYLE if on_top else 0)
+        super().__init__(None, title=slug, style=style)
         self.app = app
         self.slug = slug
         self.SetMinSize((120, 60))
@@ -214,8 +214,27 @@ class NoteFrame(wx.Frame):
             self.text.SetBackgroundColour(bg)
             self.text.Refresh()
 
+    @property
+    def on_top(self) -> bool:
+        return bool(self.GetWindowStyleFlag() & wx.STAY_ON_TOP)
+
     def toggle_on_top(self) -> None:
-        self.SetWindowStyleFlag(self.GetWindowStyleFlag() ^ wx.STAY_ON_TOP)
+        self.set_on_top(not self.on_top)
+
+    def set_on_top(self, on_top: bool) -> None:
+        style = self.GetWindowStyleFlag()
+        style = style | self.ON_TOP_STYLE if on_top else style & ~self.ON_TOP_STYLE
+        rect = self.GetRect()
+        shown = self.IsShown()
+        # タスクバー / Alt+Tab への登録を変えるには一度隠す必要がある
+        if shown:
+            self.Hide()
+        self.SetWindowStyleFlag(style)
+        self.SetRect(rect)
+        if shown:
+            self.Show()
+            self.Raise()
+        self.app.remember_on_top(self.slug, on_top)
 
     def refresh_look(self) -> None:
         self._update_look()
@@ -348,7 +367,12 @@ class MemoApp(wx.App):
         if create and self.store.read(slug) is None:
             self.store.write(slug, "")
             self.sync.request()
-        frame = NoteFrame(self, slug, self.config.data["windows"].get(slug))
+        frame = NoteFrame(
+            self,
+            slug,
+            self.config.data["windows"].get(slug),
+            on_top=slug not in self.config.data["not_on_top"],
+        )
         self.frames[slug] = frame
         frame.Show()
         if slug not in self.config.data["open"]:
@@ -381,6 +405,14 @@ class MemoApp(wx.App):
         self.config.data["windows"][frame.slug] = [r.x, r.y, r.width, r.height]
         self._config_timer.Start(1000)
 
+    def remember_on_top(self, slug: str, on_top: bool) -> None:
+        lst = self.config.data["not_on_top"]
+        if on_top and slug in lst:
+            lst.remove(slug)
+        elif not on_top and slug not in lst:
+            lst.append(slug)
+        self._config_timer.Start(1000)
+
     def new_note_dialog(self) -> None:
         dlg = wx.TextEntryDialog(None, "slug (英小文字・数字・ハイフン)", "新規メモ")
         try:
@@ -410,6 +442,8 @@ class MemoApp(wx.App):
         if slug in self.config.data["open"]:
             self.config.data["open"].remove(slug)
         self.config.data["windows"].pop(slug, None)
+        if slug in self.config.data["not_on_top"]:
+            self.config.data["not_on_top"].remove(slug)
         self.config.save()
         self.sync.request()
 
