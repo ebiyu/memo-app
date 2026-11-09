@@ -4,8 +4,8 @@ import pytest
 
 wx = pytest.importorskip("wx")
 
-from memo.desktop.app import NoteFrame  # noqa: E402
-from memo.desktop.store import LocalStore  # noqa: E402
+from memo.desktop.app import CONFLICT_BG, NoteFrame  # noqa: E402
+from memo.desktop.store import LocalStore, SyncState  # noqa: E402
 
 
 class FakeApp:
@@ -87,6 +87,20 @@ def test_conflict_turns_title_warning(frame):
     frame.reconcile()
     assert "<<<<<<< local" in frame.text.GetValue()
     assert frame.GetTitle().startswith("⚠")
+
+
+def test_conflict_warning_cleared_after_marker_push(frame):
+    marked = "<<<<<<< local\nA\n=======\nB\n>>>>>>> remote\n"
+    store = frame.app.store
+    store.write("m", marked)
+    store.set_state("m", SyncState(2, "B\n", conflict=True))
+    frame.reconcile()
+    assert frame.GetTitle().startswith("⚠")
+    # Ctrl+S でマーカーごと push 済み
+    store.set_state("m", SyncState(3, marked))
+    frame.refresh_look()
+    assert frame.GetTitle() == "m"
+    assert frame.text.GetBackgroundColour() != CONFLICT_BG
 
 
 def test_remote_delete_closes_unedited(frame):

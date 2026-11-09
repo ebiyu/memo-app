@@ -4,7 +4,8 @@
 - サーバーは version による楽観ロックのみ (不一致なら 409)。
 - 409 を受けたらクライアントが 3-way merge (base=最後に一致した内容)。
 - 自動マージできなければ、コンフリクトマーカー入りの本文をローカルに書き出し、
-  ユーザーがマーカーを消すまで push しない。
+  ユーザーがマーカーを消すまで push しない。ただし Ctrl+S (force) された場合は
+  マーカー入りのまま push する。
 - 通信中はロックを持たない。通信後、ローカルが変わっていたら書き込まず次回に回す。
 """
 
@@ -68,6 +69,14 @@ class SyncEngine:
     def force(self, slug: str) -> None:
         with self._hold_lock:
             self._forced.add(slug)
+
+    def _is_forced(self, slug: str) -> bool:
+        with self._hold_lock:
+            return slug in self._forced
+
+    def _unforce(self, slug: str) -> None:
+        with self._hold_lock:
+            self._forced.discard(slug)
 
     def _is_held(self, slug: str) -> bool:
         with self._hold_lock:
@@ -133,8 +142,8 @@ class SyncEngine:
         if local is not None:
             changed = st is None or rmeta is None or local != base
             if changed:
-                if st and st.conflict and has_conflict_markers(local):
-                    return  # ユーザーが解消するまで待つ
+                if st and st.conflict and has_conflict_markers(local) and not self._is_forced(slug):
+                    return  # ユーザーが解消するか、Ctrl+S でマーカーごと保存するまで待つ
                 if self._is_held(slug):
                     return  # 編集中: Ctrl+S か非アクティブ 5 分まで待つ (pull もしない)
                 self._push(slug, local, bv, base, report)
@@ -204,6 +213,8 @@ class SyncEngine:
 
         # 自動マージ不可: マーカー入りで書き出し、base はリモートに進める
         if self._write_local_if_unchanged(slug, local, result.text):
+            # この回の Ctrl+S はマーカーを見る前のもの。マーカー入り push は次の Ctrl+S から
+            self._unforce(slug)
             self.store.set_state(
                 slug, SyncState(current["version"], remote_text, conflict=True)
             )

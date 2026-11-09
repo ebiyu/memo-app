@@ -62,6 +62,31 @@ def test_conflict_markers_then_resolve(client, tmp_path):
     assert a.read("m") == "A and B\n"
 
 
+def test_force_pushes_conflict_markers(client, tmp_path):
+    a, ea, _ = make(client, tmp_path, "a")
+    b, eb, _ = make(client, tmp_path, "b")
+    a.write("m", "x\n")
+    ea.sync_all()
+    eb.sync_all()
+
+    a.write("m", "A\n")
+    b.write("m", "B\n")
+    ea.sync_all()
+    # Ctrl+S で同期した結果コンフリクト -> その回の force はマーカー入り push に使わない
+    eb.force("m")
+    assert eb.sync_all().conflicts == ["m"]
+    assert not eb.sync_all().pushed
+
+    # もう一度 Ctrl+S -> マーカー入りのまま push
+    text = b.read("m")
+    eb.force("m")
+    assert eb.sync_all().pushed == ["m"]
+    assert client.get("/api/notes/m").json()["content"] == text
+    assert not b.get_state("m").conflict
+    ea.sync_all()
+    assert a.read("m") == text
+
+
 def test_delete_propagates(client, tmp_path):
     a, ea, _ = make(client, tmp_path, "a")
     b, eb, changes = make(client, tmp_path, "b")

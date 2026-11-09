@@ -375,8 +375,11 @@ class NoteFrame(wx.Frame):
 
     def _update_look(self) -> None:
         text = self.text.GetValue()
-        conflict = has_conflict_markers(text)
         st = self.app.store.get_state(self.slug)
+        # Ctrl+S でマーカーごとサーバーに保存済み (base にマーカーがあり、未解決の
+        # コンフリクトでもない) なら、意図的に残したものとして警告しない
+        accepted = st is not None and not st.conflict and has_conflict_markers(st.base)
+        conflict = has_conflict_markers(text) and not accepted
         unsynced = st is None or st.base != text
         mark = "⚠ " if conflict else "● " if unsynced else ""
         title = mark + self.slug
