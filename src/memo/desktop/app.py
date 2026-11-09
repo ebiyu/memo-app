@@ -347,6 +347,7 @@ class NoteFrame(wx.Frame):
         if not self or self.IsBeingDeleted():
             return
         if evt.GetActive():
+            self.app.last_active = self.slug
             self._release_timer.Stop()
             self.app.engine.hold(self.slug)
         else:
@@ -482,6 +483,7 @@ class MemoApp(wx.App):
         self.http = httpx.Client(base_url=server, timeout=10.0, headers=headers)
 
         self.frames: dict[str, NoteFrame] = {}
+        self.last_active: str | None = None
         self._cascade = 0
         self._config_timer = wx.CallLater(1000, self.config.save)
         self._config_timer.Stop()
@@ -490,6 +492,7 @@ class MemoApp(wx.App):
         self.engine = engine
         self.sync = BackgroundSync(engine, interval=self._interval, on_status=self._on_status_threaded)
         self.tray = MemoTaskBarIcon(self)
+        self._register_hotkey()
 
         for slug in list(self.config.data["open"]):
             if self.store.read(slug) is not None:
@@ -585,6 +588,30 @@ class MemoApp(wx.App):
         for f in self.frames.values():
             f.Raise()
 
+    # --- グローバルホットキー ---
+    def _register_hotkey(self) -> None:
+        # RegisterHotKey にはウィンドウが要るので、表示しない専用フレームを持たせる
+        self._hotkey_owner = wx.Frame(None)
+        self._hotkey_id = 1  # RegisterHotKey のアプリ用 ID は 0x0000〜0xBFFF
+        if self._hotkey_owner.RegisterHotKey(
+                self._hotkey_id, wx.MOD_CONTROL | wx.MOD_ALT, ord("M")):
+            self._hotkey_owner.Bind(wx.EVT_HOTKEY, lambda e: self.focus_notes(),
+                                    id=self._hotkey_id)
+        else:
+            log.warning("global hotkey Ctrl+Alt+M is already in use")
+            self.tray.ShowBalloon("memo", "Ctrl+Alt+M は他のアプリが使用中のため登録できませんでした")
+
+    def focus_notes(self) -> None:
+        """全付箋を前面に出し、最後にアクティブだった付箋にフォーカスする。"""
+        self.ensure_window()
+        for f in self.frames.values():
+            if f.IsIconized():
+                f.Iconize(False)
+            f.Raise()
+        target = self.frames.get(self.last_active) or next(iter(self.frames.values()))
+        target.Raise()
+        target.text.SetFocus()
+
     def remember_rect(self, frame: NoteFrame) -> None:
         if frame.IsIconized():
             return
@@ -658,6 +685,8 @@ class MemoApp(wx.App):
         self.config.data["open"] = open_slugs
         self.config.save()
         self.sync.stop()
+        self._hotkey_owner.UnregisterHotKey(self._hotkey_id)
+        self._hotkey_owner.Destroy()
         self.tray.RemoveIcon()
         self.tray.Destroy()
         self.ExitMainLoop()
