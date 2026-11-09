@@ -465,7 +465,8 @@ class MemoApp(wx.App):
 
     def OnInit(self) -> bool:
         self.SetAppName("memo")
-        self.SetExitOnFrameDelete(False)  # 付箋を全部閉じてもトレイに常駐
+        # 終了は quit() で明示的に行う (最後の付箋を閉じたときも quit() 経由)
+        self.SetExitOnFrameDelete(False)
         key = hashlib.sha1(str(self._data_dir.resolve()).lower().encode()).hexdigest()[:12]
         self._checker = wx.SingleInstanceChecker(f"memo-{key}")
         if self._checker.IsAnotherRunning():
@@ -492,8 +493,7 @@ class MemoApp(wx.App):
         for slug in list(self.config.data["open"]):
             if self.store.read(slug) is not None:
                 self.open_note(slug)
-        if not self.frames and not self.store.slugs():
-            self.open_note("scratch", create=True)
+        self.ensure_window()
 
         self.sync.start()
         return True
@@ -549,6 +549,12 @@ class MemoApp(wx.App):
         self._config_timer.Start(1000)
 
     def close_note(self, slug: str) -> None:
+        deleted = self.store.read(slug) is None  # リモート削除による自動クローズ
+        if not deleted and list(self.frames) == [slug]:
+            # 最後の付箋を閉じたらアプリごと終了する。付箋は「開いたまま」として
+            # 記録されるので、次回起動時に再表示される。
+            self.quit()
+            return
         frame = self.frames.pop(slug, None)
         if frame:
             self.remember_rect(frame)
@@ -556,6 +562,17 @@ class MemoApp(wx.App):
         if slug in self.config.data["open"]:
             self.config.data["open"].remove(slug)
         self._config_timer.Start(1000)
+        self.ensure_window()
+
+    def ensure_window(self) -> None:
+        """付箋が 1 枚も表示されていなければ、既存メモの先頭 (なければ新規) を開く。"""
+        if self.frames:
+            return
+        slugs = self.store.slugs()
+        if slugs:
+            self.open_note(slugs[0])
+        else:
+            self.open_note("scratch", create=True)
 
     def toggle_note(self, slug: str) -> None:
         if slug in self.frames:
@@ -615,6 +632,7 @@ class MemoApp(wx.App):
             self.config.data["not_on_top"].remove(slug)
         self.config.save()
         self.sync.request()
+        self.ensure_window()
 
     def quit(self) -> None:
         open_slugs = list(self.frames)
