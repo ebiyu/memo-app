@@ -76,6 +76,14 @@ class ThinScrollBar(wx.Window):
         self._timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, lambda e: self.sync())
         self._timer.Start(80)
+        # wx.Timer はオーナーと一緒に止まらない。破棄済みウィンドウに EVT_TIMER が
+        # 届くとヒープが壊れてプロセスごと落ちるので、破棄時に必ず止める。
+        self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
+
+    def _on_destroy(self, evt: wx.WindowDestroyEvent) -> None:
+        evt.Skip()
+        if evt.GetEventObject() is self:  # 子から伝播してきたものは無視
+            self._timer.Stop()
 
     def _hide_native_scrollbar(self) -> None:
         """EDIT から WS_VSCROLL だけを外す。
