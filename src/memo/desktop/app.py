@@ -274,6 +274,29 @@ def make_icon() -> wx.Icon:
     return icon
 
 
+def shift_lines(text: str, start: int, end: int, down: bool) -> tuple[str, int, int] | None:
+    """[start, end] を含む論理行の塊を、1 行上/下の行と入れ替える。
+
+    戻り値は (新しい本文, 移動後の選択開始, 移動後の選択終了)。端の行で動かせないときは None。
+    """
+    lines = text.split("\n")
+    # 選択が次の行頭で終わっているときは、その行は塊に含めない
+    stop = end - 1 if end > start and text[end - 1] == "\n" else end
+    first = text.count("\n", 0, start)
+    last = text.count("\n", 0, stop)
+    if down:
+        if last + 1 >= len(lines):
+            return None
+        lines[first:last + 2] = [lines[last + 1]] + lines[first:last + 1]
+        delta = len(lines[first]) + 1
+    else:
+        if first == 0:
+            return None
+        lines[first - 1:last + 1] = lines[first:last + 1] + [lines[first - 1]]
+        delta = -(len(lines[last]) + 1)
+    return "\n".join(lines), start + delta, end + delta
+
+
 class NoteFrame(wx.Frame):
     # タスクバー・Alt+Tab に出すため wx.FRAME_TOOL_WINDOW / wx.FRAME_NO_TASKBAR は使わない
     # (後者は隠しオーナー付きで作られ、Alt+Tab に出なくなる)。
@@ -332,20 +355,23 @@ class NoteFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord("S"), ids["sync"]),
         ]))
 
-    # --- 選択なしの Ctrl+C / Ctrl+X で行ごとコピー・カット ---
+    # --- 行単位の編集: 選択なしの Ctrl+C / Ctrl+X と Alt+↑/↓ ---
     def _on_key_down(self, evt: wx.KeyEvent) -> None:
         key = evt.GetKeyCode()
-        if evt.GetModifiers() == wx.MOD_CONTROL and key in (ord("C"), ord("X")):
+        mods = evt.GetModifiers()
+        if mods == wx.MOD_CONTROL and key in (ord("C"), ord("X")):
             start, end = self.text.GetSelection()
             if start == end:
                 self._copy_line(cut=key == ord("X"))
                 return
+        if mods == wx.MOD_ALT and key in (wx.WXK_UP, wx.WXK_DOWN,
+                                          wx.WXK_NUMPAD_UP, wx.WXK_NUMPAD_DOWN):
+            self.move_lines(down=key in (wx.WXK_DOWN, wx.WXK_NUMPAD_DOWN))
+            return
         evt.Skip()
 
-    def _copy_line(self, cut: bool) -> None:
-        """カーソルのある論理行 (折り返しではなく改行区切り) を改行付きでコピーする。"""
-        value = self.text.GetValue()
-        # MSW の EDIT は位置を CRLF 2 文字で数えるので、GetValue() の添字と相互変換する
+    def _index_conv(self, value: str):
+        """MSW の EDIT は位置を CRLF 2 文字で数えるので、GetValue() の添字と相互変換する。"""
         crlf = self.text.GetLastPosition() != len(value)
 
         def to_index(pos: int) -> int:
@@ -356,6 +382,12 @@ class NoteFrame(wx.Frame):
         def to_pos(text: str, idx: int) -> int:
             return idx + text.count("\n", 0, idx) if crlf else idx
 
+        return to_index, to_pos
+
+    def _copy_line(self, cut: bool) -> None:
+        """カーソルのある論理行 (折り返しではなく改行区切り) を改行付きでコピーする。"""
+        value = self.text.GetValue()
+        to_index, to_pos = self._index_conv(value)
         idx = to_index(self.text.GetInsertionPoint())
         s = value.rfind("\n", 0, idx) + 1
         e = value.find("\n", idx)
@@ -381,6 +413,21 @@ class NoteFrame(wx.Frame):
             return
         self.text.Remove(to_pos(value, rs), to_pos(value, re_))
         self.text.SetInsertionPoint(to_pos(self.text.GetValue(), target))
+
+    def move_lines(self, down: bool) -> None:
+        """カーソル行 (選択があればその範囲の行) を 1 行上/下へ入れ替える。"""
+        value = self.text.GetValue()
+        to_index, to_pos = self._index_conv(value)
+        sel_start, sel_end = self.text.GetSelection()
+        moved = shift_lines(value, to_index(sel_start), to_index(sel_end), down)
+        if moved is None:
+            return  # 端の行なので動かせない
+        new_value, new_start, new_end = moved
+        if new_value != value:
+            # 素の EDIT の undo は 1 段だけで、消す・入れるの 2 操作に分けると
+            # Ctrl+Z が中途半端な状態を作る。全体を入れ替えて undo 履歴を捨てる
+            self.text.SetValue(new_value)  # EVT_TEXT 経由で自動保存に乗る
+        self.text.SetSelection(to_pos(new_value, new_start), to_pos(new_value, new_end))
 
     # --- 保存とローカル変更の取り込み ---
     def _on_text(self, _evt) -> None:
