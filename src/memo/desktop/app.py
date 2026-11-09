@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import logging
@@ -31,6 +32,169 @@ DEFAULT_SIZE = (240, 180)
 SAVE_DELAY_MS = 700
 # 編集中の付箋が非アクティブになってから、手元の変更を自動 push するまでの時間
 INACTIVE_PUSH_DELAY_MS = 5 * 60 * 1000
+
+
+GWL_STYLE = -16
+WS_VSCROLL = 0x00200000
+# SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED
+SWP_FRAMECHANGED_ONLY = 0x0001 | 0x0002 | 0x0004 | 0x0020
+
+
+class ThinScrollBar(wx.Window):
+    """付箋の背景に溶け込む細いスクロールバー。
+
+    素の EDIT のスクロールバーは灰色のトラックが付いて太く見えるので、
+    EDIT 側のスクロールバーは消し、隣にこれを並べる。
+    普段は細い線、ホバー・ドラッグ中は少し太くなる。
+    """
+
+    WIDTH = 10
+    THIN, THICK = 3, 6
+    MIN_THUMB = 16
+    EM_GETFIRSTVISIBLELINE = 0x00CE
+    EM_LINESCROLL = 0x00B6
+
+    def __init__(self, parent: wx.Window, target: wx.TextCtrl):
+        super().__init__(parent, size=(self.WIDTH, -1), style=wx.BORDER_NONE)
+        self.target = target
+        self._hide_native_scrollbar()
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetMinSize((self.WIDTH, -1))
+        self._state: tuple[int, int, int] = (0, 0, 0)  # (first, visible, total)
+        self._hover = False
+        self._wheel_acc = 0
+        self._drag: tuple[int, int] | None = None  # (開始 y, 開始時の first)
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_down)
+        self.Bind(wx.EVT_LEFT_UP, self._on_up)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, lambda e: self._end_drag())
+        self.Bind(wx.EVT_ENTER_WINDOW, lambda e: self._set_hover(True))
+        self.Bind(wx.EVT_LEAVE_WINDOW, lambda e: self._set_hover(False))
+        # WS_VSCROLL の無い EDIT はホイールを無視するので、こちらで処理する
+        self.Bind(wx.EVT_MOUSEWHEEL, self._on_wheel)
+        target.Bind(wx.EVT_MOUSEWHEEL, self._on_wheel)
+        # EDIT のスクロールは wx のイベントにならないので軽くポーリングする
+        self._timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, lambda e: self.sync())
+        self._timer.Start(80)
+
+    def _hide_native_scrollbar(self) -> None:
+        """EDIT から WS_VSCROLL だけを外す。
+
+        wx.TE_NO_VSCROLL で作ると ES_AUTOVSCROLL まで外れ、表示範囲の最下行より
+        下に入力できなくなる (Enter が効かない)。ES_AUTOVSCROLL は作成時にしか
+        付けられないので、普通に作ってからスクロールバーのスタイルだけ外す。
+        """
+        user32 = ctypes.windll.user32
+        hwnd = self.target.GetHandle()
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_VSCROLL)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FRAMECHANGED_ONLY)
+
+    def _query(self) -> tuple[int, int, int]:
+        t = self.target
+        total = max(t.GetNumberOfLines(), 1)
+        first = ctypes.windll.user32.SendMessageW(t.GetHandle(), self.EM_GETFIRSTVISIBLELINE, 0, 0)
+        line_h = max(t.GetCharHeight(), 1)
+        visible = max(t.GetClientSize().height // line_h, 1)
+        return first, visible, total
+
+    def sync(self) -> None:
+        if self.IsBeingDeleted():
+            return
+        state = self._query()
+        if state != self._state:
+            self._state = state
+            self.Refresh()
+
+    def _thumb(self) -> tuple[int, int] | None:
+        """つまみの (top, height)。スクロール不要なら None。"""
+        first, visible, total = self._state
+        if total <= visible:
+            return None
+        h = self.GetClientSize().height
+        thumb_h = max(h * visible // total, self.MIN_THUMB)
+        max_first = total - visible
+        top = (h - thumb_h) * min(first, max_first) // max_first
+        return top, thumb_h
+
+    def _on_paint(self, _evt) -> None:
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(self.GetBackgroundColour()))
+        dc.Clear()
+        thumb = self._thumb()
+        if thumb is None:
+            return
+        top, thumb_h = thumb
+        active = self._hover or self._drag is not None
+        w = self.THICK if active else self.THIN
+        alpha = 150 if active else 100
+        x = (self.WIDTH - w) // 2
+        gc = wx.GraphicsContext.Create(dc)
+        gc.SetPen(wx.TRANSPARENT_PEN)
+        gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, alpha)))
+        gc.DrawRoundedRectangle(x, top + 2, w, thumb_h - 4, w / 2)
+
+    def _set_hover(self, hover: bool) -> None:
+        self._hover = hover
+        self.Refresh()
+
+    def _scroll_to(self, first: int) -> None:
+        cur, visible, total = self._query()
+        first = max(0, min(first, total - visible))
+        if first != cur:
+            ctypes.windll.user32.SendMessageW(
+                self.target.GetHandle(), self.EM_LINESCROLL, 0, first - cur)
+        self.sync()
+
+    def _on_wheel(self, evt: wx.MouseEvent) -> None:
+        if evt.GetWheelAxis() != wx.MOUSE_WHEEL_VERTICAL or not evt.GetWheelDelta():
+            evt.Skip()
+            return
+        # タッチパッドの細かい回転量は端数を持ち越して積算する
+        self._wheel_acc += -evt.GetWheelRotation() * evt.GetLinesPerAction()
+        lines = int(self._wheel_acc / evt.GetWheelDelta())
+        self._wheel_acc -= lines * evt.GetWheelDelta()
+        if lines:
+            self._scroll_to(self._query()[0] + lines)
+
+    def _on_down(self, evt: wx.MouseEvent) -> None:
+        thumb = self._thumb()
+        if thumb is None:
+            return
+        top, thumb_h = thumb
+        y = evt.GetY()
+        first, visible, _ = self._state
+        if top <= y < top + thumb_h:
+            self._drag = (y, first)
+            self.CaptureMouse()
+            self.Refresh()
+        else:  # トラッククリックは 1 ページ送り
+            self._scroll_to(first + (visible if y >= top + thumb_h else -visible))
+
+    def _on_motion(self, evt: wx.MouseEvent) -> None:
+        if self._drag is None:
+            return
+        thumb = self._thumb()
+        if thumb is None:
+            return
+        start_y, start_first = self._drag
+        _, visible, total = self._state
+        track = self.GetClientSize().height - thumb[1]
+        if track > 0:
+            self._scroll_to(start_first + (evt.GetY() - start_y) * (total - visible) // track)
+
+    def _on_up(self, _evt) -> None:
+        self._end_drag()
+
+    def _end_drag(self) -> None:
+        if self._drag is None:
+            return
+        self._drag = None
+        if self.HasCapture():
+            self.ReleaseMouse()
+        self.Refresh()
 
 
 class Config:
@@ -83,11 +247,14 @@ class NoteFrame(wx.Frame):
         self.slug = slug
         self.SetMinSize((120, 60))
 
-        self.text = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_NOHIDESEL | wx.BORDER_NONE)
+        self.text = wx.TextCtrl(
+            self, style=wx.TE_MULTILINE | wx.TE_NOHIDESEL | wx.BORDER_NONE)
         self.text.SetFont(wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL,
                                   wx.FONTWEIGHT_NORMAL, faceName="Yu Gothic UI"))
+        self.scrollbar = ThinScrollBar(self, self.text)
         sizer = wx.BoxSizer()
         sizer.Add(self.text, 1, wx.EXPAND)
+        sizer.Add(self.scrollbar, 0, wx.EXPAND)
         self.SetSizer(sizer)
 
         self.disk_text = app.store.read(slug) or ""
@@ -213,6 +380,8 @@ class NoteFrame(wx.Frame):
         if self.text.GetBackgroundColour() != bg:
             self.text.SetBackgroundColour(bg)
             self.text.Refresh()
+            self.scrollbar.SetBackgroundColour(bg)
+            self.scrollbar.Refresh()
 
     @property
     def on_top(self) -> bool:
