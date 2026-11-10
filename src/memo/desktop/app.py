@@ -762,7 +762,9 @@ class MemoApp(wx.App):
 
     def new_note_dialog(self) -> None:
         prefix = datetime.date.today().strftime("%y%m%d") + "-"
-        dlg = wx.TextEntryDialog(None, "slug (英小文字・数字・ハイフン)", "新規メモ", prefix)
+        dlg = wx.TextEntryDialog(
+            None, "slug (英小文字・数字・ハイフン、先頭と末尾の '-' は不可)", "新規メモ", prefix
+        )
         text = next((c for c in dlg.GetChildren() if isinstance(c, wx.TextCtrl)), None)
         if text:
             # slug は ASCII のみなので IME を切り離す (半角のまま打てるように)
@@ -770,21 +772,43 @@ class MemoApp(wx.App):
             imm.ImmAssociateContext.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             imm.ImmAssociateContext.restype = ctypes.c_void_p
             imm.ImmAssociateContext(text.GetHandle(), None)
+
+        def normalized() -> str:
+            # dlg.GetValue() は OK 処理まで入力欄の内容を反映しないので TextCtrl から読む
+            return (text or dlg).GetValue().strip().lower()
+
+        def is_valid() -> bool:
+            try:
+                validate_slug(normalized())
+                return True
+            except InvalidSlug:
+                return False
+
+        # 不正な slug ではダイアログを閉じさせない。閉じて MessageBox → 再表示にすると、
+        # MessageBox を Enter で閉じた入力が再表示後のダイアログに漏れて無限ループになる。
+        ok_button = dlg.FindWindow(wx.ID_OK)
+
+        def update_ok(event=None) -> None:
+            if ok_button:
+                ok_button.Enable(is_valid())
+            if event:
+                event.Skip()
+
+        def on_ok(event) -> None:
+            if is_valid():
+                event.Skip()
+            else:
+                wx.Bell()
+
+        dlg.Bind(wx.EVT_BUTTON, on_ok, id=wx.ID_OK)
+        if text:
+            text.Bind(wx.EVT_TEXT, update_ok)
+            # 既定では全選択されるので、表示後にカーソルを末尾へ移す
+            wx.CallAfter(text.SetInsertionPointEnd)
+        update_ok()
         try:
-            while True:
-                # 既定では全選択されるので、表示後にカーソルを末尾へ移す
-                if text:
-                    wx.CallAfter(text.SetInsertionPointEnd)
-                if dlg.ShowModal() != wx.ID_OK:
-                    break
-                slug = dlg.GetValue().strip().lower()
-                try:
-                    validate_slug(slug)
-                except InvalidSlug:
-                    wx.MessageBox("slug は a-z, 0-9, '-' の 1〜64 文字です。", "memo")
-                    continue
-                self.open_note(slug, create=True)
-                return
+            if dlg.ShowModal() == wx.ID_OK and is_valid():
+                self.open_note(normalized(), create=True)
         finally:
             dlg.Destroy()
 
