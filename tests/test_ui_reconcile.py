@@ -188,6 +188,39 @@ def test_pin_mark_and_frame_colour(frame):
     assert frame._frame_pinned is True
 
 
+def test_menu_bar_hidden_while_pinned(frame):
+    assert frame.on_top and frame.GetMenuBar() is None
+
+    frame.toggle_on_top()
+    bar = frame.GetMenuBar()
+    assert bar is not None
+    assert [bar.GetMenuLabelText(i) for i in range(bar.GetMenuCount())] == ["ファイル", "表示"]
+    assert not bar.IsChecked(frame._ids["top"])
+    assert not bar.IsChecked(frame._ids["alpha"])
+
+    frame.toggle_translucent()
+    assert bar.IsChecked(frame._ids["alpha"])
+    frame.toggle_translucent()
+    assert not bar.IsChecked(frame._ids["alpha"])
+
+    file_menu = bar.GetMenu(0)
+    labels = [i.GetItemLabelText() for i in file_menu.GetMenuItems() if not i.IsSeparator()]
+    assert labels[1] == "メモを開く" and labels[-1] == "アプリを終了"
+
+    frame.app.store.write("other", "x")
+    frame.app.frames = {"m": frame}
+    frame._fill_open_menu()
+    frame._fill_open_menu()  # 作り直しても重複しない
+    items = frame._open_menu.GetMenuItems()
+    assert [(i.GetItemLabelText(), i.IsChecked()) for i in items] == [("m", True), ("other", False)]
+    opened = []
+    frame.app.open_note = opened.append
+    frame.ProcessEvent(wx.CommandEvent(wx.wxEVT_MENU, items[1].GetId()))
+    assert opened == ["other"]
+
+    frame.toggle_on_top()
+    assert frame.GetMenuBar() is None
+
 def test_toggle_translucent(frame):
     import ctypes
 

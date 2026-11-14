@@ -495,7 +495,12 @@ class NoteFrame(wx.Frame):
         self.Bind(wx.EVT_SIZE, lambda e: (app.remember_rect(self), e.Skip()))
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
-        ids = {name: wx.NewIdRef() for name in ("new", "close", "top", "delete", "sync", "alpha")}
+        self._ids = ids = {name: wx.NewIdRef()
+                           for name in ("new", "close", "top", "delete", "sync", "alpha", "quit")}
+        self._open_menu: wx.Menu | None = None
+        self._open_item_ids: list[wx.WindowIDRef] = []
+        self.Bind(wx.EVT_MENU, lambda e: app.quit(), id=ids["quit"])
+        self.Bind(wx.EVT_MENU_OPEN, self._on_menu_open)
         self.Bind(wx.EVT_MENU, lambda e: app.new_note_dialog(), id=ids["new"])
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=ids["close"])
         self.Bind(wx.EVT_MENU, lambda e: self.toggle_on_top(), id=ids["top"])
@@ -510,6 +515,68 @@ class NoteFrame(wx.Frame):
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_DELETE, ids["delete"]),
             (wx.ACCEL_CTRL, ord("S"), ids["sync"]),
         ]))
+        self._update_menu_bar()
+
+    # --- メニューバー (pin 中は付箋らしく見せるため出さない) ---
+    def _build_menu_bar(self) -> wx.MenuBar:
+        # ショートカットはフレームのアクセラレータテーブルが担うので、ラベルの
+        # "	" 以降は表示用。編集系 (Ctrl+C など) は行単位コピーと衝突するので載せない
+        ids = self._ids
+        file_menu = wx.Menu()
+        file_menu.Append(ids["new"], "新規メモ…	Ctrl+N")
+        self._open_menu = wx.Menu()  # 中身は開くたびに _fill_open_menu で作り直す
+        file_menu.AppendSubMenu(self._open_menu, "メモを開く")
+        file_menu.Append(ids["sync"], "今すぐ同期	Ctrl+S")
+        file_menu.AppendSeparator()
+        file_menu.Append(ids["delete"], "削除…	Ctrl+Shift+Delete")
+        file_menu.AppendSeparator()
+        file_menu.Append(ids["close"], "閉じる	Ctrl+W")
+        file_menu.Append(ids["quit"], "アプリを終了")
+        view_menu = wx.Menu()
+        view_menu.AppendCheckItem(ids["top"], "最前面に固定 (pin)	Ctrl+T")
+        view_menu.AppendCheckItem(ids["alpha"], "背景を半透明	Ctrl+Shift+T").Check(self.translucent)
+        bar = wx.MenuBar()
+        bar.Append(file_menu, "ファイル(&F)")
+        bar.Append(view_menu, "表示(&V)")
+        return bar
+
+    def _on_menu_open(self, evt: wx.MenuEvent) -> None:
+        evt.Skip()
+        # 「ファイル」を開いた時点で作っておく (サブメニュー単体の open 通知と
+        # wrapper の同一性に頼らないため、どのメニューでも作り直す)
+        if self._open_menu is not None:
+            self._fill_open_menu()
+
+    def _fill_open_menu(self) -> None:
+        """「メモを開く」をメモ一覧で作り直す。開いているものにはチェックを付ける。"""
+        menu = self._open_menu
+        for item in list(menu.GetMenuItems()):
+            menu.Delete(item)
+        for id_ in self._open_item_ids:
+            self.Unbind(wx.EVT_MENU, id=id_)
+        self._open_item_ids = []
+        slugs = self.app.store.slugs()
+        for slug in slugs:
+            id_ = wx.NewIdRef()
+            self._open_item_ids.append(id_)
+            menu.AppendCheckItem(id_, slug).Check(slug in self.app.frames)
+            # 開いていれば前面に出す (トレイと違い、選んでも閉じない)
+            self.Bind(wx.EVT_MENU, lambda e, s=slug: self.app.open_note(s), id=id_)
+        if not slugs:
+            menu.Append(wx.ID_ANY, "(メモなし)").Enable(False)
+
+    def _update_menu_bar(self) -> None:
+        want = not self.on_top
+        bar = self.GetMenuBar()
+        if want and bar is None:
+            self.SetMenuBar(self._build_menu_bar())
+        elif not want and bar is not None:
+            self.SetMenuBar(None)
+            bar.Destroy()
+            self._open_menu = None
+        else:
+            return
+        self.place_backdrop()  # クライアント領域が変わるので半透明の下敷きを合わせ直す
 
     # --- 行単位の編集: 選択なしの Ctrl+C / Ctrl+X、Alt+↑/↓、Ctrl+Enter ---
     def _on_key_down(self, evt: wx.KeyEvent) -> None:
@@ -724,6 +791,7 @@ class NoteFrame(wx.Frame):
         style = style | self.ON_TOP_STYLE if on_top else style & ~self.ON_TOP_STYLE
         self.SetWindowStyleFlag(style)
         self._update_look()
+        self._update_menu_bar()
         self.app.remember_on_top(self.slug, on_top)
 
     def toggle_translucent(self) -> None:
@@ -751,6 +819,9 @@ class NoteFrame(wx.Frame):
             _user32.RedrawWindow(hwnd, None, None,
                                  RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN)
         self.translucent = translucent
+        bar = self.GetMenuBar()
+        if bar is not None:
+            bar.Check(self._ids["alpha"], translucent)
         if remember:
             self.app.remember_translucent(self.slug, translucent)
 
