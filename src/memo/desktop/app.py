@@ -39,6 +39,11 @@ BACKDROP_ALPHA = 140
 # 半透明モードで入力欄の背景に塗る色。この色の画素だけを透過させる。
 # 文字のふちはこの色と混ざるので、付箋の地色に近い色にしてにじみを目立たなくする
 TRANSPARENT_KEY = wx.Colour(255, 248, 197)
+# 最前面 (pin) 中の付箋のタイトルバー・枠・タイトル文字の色 (Windows 11 の DWM で塗る)
+PIN_CAPTION = wx.Colour(255, 234, 140)
+PIN_BORDER = wx.Colour(224, 168, 32)
+PIN_TEXT = wx.Colour(70, 56, 16)
+PIN_MARK = "📌 "
 # 編集中の付箋が非アクティブになってから、手元の変更を自動 push するまでの時間
 INACTIVE_PUSH_DELAY_MS = 5 * 60 * 1000
 
@@ -62,6 +67,8 @@ WM_CONTEXTMENU = 0x007B
 WM_MOUSEWHEEL = 0x020A
 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK = 0x0201, 0x0202, 0x0203
 MK_LBUTTON = 0x0001
+DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR = 34, 35, 36
+DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
@@ -80,6 +87,10 @@ _user32.IsIconic.argtypes = [wintypes.HWND]
 _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 _user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+
+_dwmapi = ctypes.WinDLL("dwmapi")
+_dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p,
+                                          wintypes.DWORD]
 
 _SUBCLASSPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
                                    ctypes.c_size_t, ctypes.c_ssize_t,
@@ -103,6 +114,12 @@ def _set_ex_style(hwnd: int, style: int) -> None:
 
 def _colorref(c: wx.Colour) -> int:
     return c.Red() | c.Green() << 8 | c.Blue() << 16
+
+
+def _set_dwm_colour(hwnd: int, attr: int, value: int) -> None:
+    """Windows 10 以前では未対応の属性なので失敗するが、見た目が変わらないだけで無害。"""
+    v = wintypes.DWORD(value)
+    _dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
 
 
 def _makelparam(x: int, y: int) -> int:
@@ -459,6 +476,7 @@ class NoteFrame(wx.Frame):
         self.translucent = False
         self.backdrop: Backdrop | None = None
         self._subclass_proc = None
+        self._frame_pinned: bool | None = None  # DWM で塗った状態のキャッシュ
         self._update_look()
         if translucent:
             self.set_translucent(True, remember=False)
@@ -669,9 +687,10 @@ class NoteFrame(wx.Frame):
         conflict = has_conflict_markers(text) and not accepted
         unsynced = st is None or st.base != text
         mark = "⚠ " if conflict else "● " if unsynced else ""
-        title = mark + self.slug
+        title = (PIN_MARK if self.on_top else "") + mark + self.slug
         if self.GetTitle() != title:
             self.SetTitle(title)
+        self._update_frame_colours()
         bg = CONFLICT_BG if conflict else NOTE_BG
         if self.backdrop:
             self.backdrop.set_colour(bg)
@@ -681,6 +700,17 @@ class NoteFrame(wx.Frame):
             self.text.Refresh()
             self.scrollbar.SetBackgroundColour(bg)
             self.scrollbar.Refresh()
+
+    def _update_frame_colours(self) -> None:
+        """pin 中はタイトルバーと枠を付箋らしい黄色に、解除中は OS 標準に戻す。"""
+        pinned = self.on_top
+        if self._frame_pinned == pinned:
+            return
+        self._frame_pinned = pinned
+        hwnd = self.GetHandle()
+        for attr, colour in ((DWMWA_CAPTION_COLOR, PIN_CAPTION), (DWMWA_BORDER_COLOR, PIN_BORDER),
+                             (DWMWA_TEXT_COLOR, PIN_TEXT)):
+            _set_dwm_colour(hwnd, attr, _colorref(colour) if pinned else DWMWA_COLOR_DEFAULT)
 
     @property
     def on_top(self) -> bool:
@@ -693,6 +723,7 @@ class NoteFrame(wx.Frame):
         style = self.GetWindowStyleFlag()
         style = style | self.ON_TOP_STYLE if on_top else style & ~self.ON_TOP_STYLE
         self.SetWindowStyleFlag(style)
+        self._update_look()
         self.app.remember_on_top(self.slug, on_top)
 
     def toggle_translucent(self) -> None:

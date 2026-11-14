@@ -89,7 +89,7 @@ def test_conflict_turns_title_warning(frame):
     frame.app.store.write("m", "Y\n2\n3\n")
     frame.reconcile()
     assert "<<<<<<< local" in frame.text.GetValue()
-    assert frame.GetTitle().startswith("⚠")
+    assert frame.GetTitle().startswith("📌 ⚠")
 
 
 def test_conflict_warning_cleared_after_marker_push(frame):
@@ -98,11 +98,11 @@ def test_conflict_warning_cleared_after_marker_push(frame):
     store.write("m", marked)
     store.set_state("m", SyncState(2, "B\n", conflict=True))
     frame.reconcile()
-    assert frame.GetTitle().startswith("⚠")
+    assert frame.GetTitle().startswith("📌 ⚠")
     # Ctrl+S でマーカーごと push 済み
     store.set_state("m", SyncState(3, marked))
     frame.refresh_look()
-    assert frame.GetTitle() == "m"
+    assert frame.GetTitle() == "📌 m"
     assert frame.text.GetBackgroundColour() != CONFLICT_BG
 
 
@@ -145,9 +145,9 @@ def test_unsynced_marker(frame):
 
     frame.app.store.set_state("m", SyncState(1, "1\n2\n3\n"))
     frame.refresh_look()
-    assert frame.GetTitle() == "m"
+    assert frame.GetTitle() == "📌 m"
     frame.text.SetValue("changed")
-    assert frame.GetTitle() == "● m"
+    assert frame.GetTitle() == "📌 ● m"
 
 
 def test_note_is_normal_app_window_regardless_of_on_top(frame):
@@ -169,6 +169,23 @@ def test_note_is_normal_app_window_regardless_of_on_top(frame):
 
     frame.toggle_on_top()
     assert frame.on_top and ex() & WS_EX_TOPMOST and not ex() & WS_EX_TOOLWINDOW
+
+
+def test_pin_mark_and_frame_colour(frame):
+    frame.app.store.set_state("m", SyncState(1, "1\n2\n3\n"))
+    frame.refresh_look()
+    assert frame.on_top and frame.GetTitle() == "📌 m"
+    assert frame._frame_pinned is True  # タイトルバー・枠を pin 色で塗った
+
+    frame.toggle_on_top()
+    assert frame.GetTitle() == "m"
+    assert frame._frame_pinned is False  # OS 標準色に戻した
+    frame.text.SetValue("changed")
+    assert frame.GetTitle() == "● m"
+
+    frame.toggle_on_top()
+    assert frame.GetTitle() == "📌 ● m"
+    assert frame._frame_pinned is True
 
 
 def test_toggle_translucent(frame):
