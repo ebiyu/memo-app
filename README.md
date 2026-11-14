@@ -47,6 +47,7 @@ uv run memo-desktop --data-dir ./tmp/client-b --interval 5
 | 現在行の下に新しい行を挿入 | `Ctrl+Enter` |
 | 選択なしで行ごとコピー・カット | `Ctrl+C` / `Ctrl+X` |
 | 最前面の切替 | `Ctrl+T` |
+| 背景の半透明切替 (文字は不透明のまま) | `Ctrl+Shift+T` |
 | この付箋の変更を同期 | `Ctrl+S` |
 | 全体を今すぐ同期 (保留中の付箋は除く) | トレイメニュー「今すぐ同期」 |
 | 閉じる (メモは残る) | `Ctrl+W` / × |

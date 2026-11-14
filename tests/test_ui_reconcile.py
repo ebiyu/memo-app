@@ -4,7 +4,7 @@ import pytest
 
 wx = pytest.importorskip("wx")
 
-from memo.desktop.app import CONFLICT_BG, NoteFrame  # noqa: E402
+from memo.desktop.app import CONFLICT_BG, TRANSPARENT_KEY, NoteFrame  # noqa: E402
 from memo.desktop.store import LocalStore, SyncState  # noqa: E402
 
 
@@ -38,6 +38,9 @@ class FakeApp:
 
     def remember_on_top(self, slug, on_top):
         self.on_top = (slug, on_top)
+
+    def remember_translucent(self, slug, translucent):
+        self.translucent = (slug, translucent)
 
     def close_note(self, slug):
         self.closed.append(slug)
@@ -166,3 +169,56 @@ def test_note_is_normal_app_window_regardless_of_on_top(frame):
 
     frame.toggle_on_top()
     assert frame.on_top and ex() & WS_EX_TOPMOST and not ex() & WS_EX_TOOLWINDOW
+
+
+def test_toggle_translucent(frame):
+    import ctypes
+
+    u = ctypes.windll.user32
+    u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    ex = lambda h: u.GetWindowLongPtrW(h, -20)  # GWL_EXSTYLE
+    WS_EX_LAYERED, LWA_COLORKEY = 0x80000, 0x1
+    frame.Show()
+    assert not frame.translucent and frame.backdrop is None
+
+    frame.toggle_translucent()
+    note = frame.GetHandle()
+    back = frame.backdrop.GetHandle()
+    assert frame.translucent
+    assert frame.app.translucent == ("m", True)
+    # 付箋本体はキー色だけを透過し、文字は不透明のまま
+    assert ex(note) & WS_EX_LAYERED
+    key, alpha, flags = ctypes.c_uint32(), ctypes.c_ubyte(), ctypes.c_uint32()
+    assert u.GetLayeredWindowAttributes(note, ctypes.byref(key), ctypes.byref(alpha),
+                                        ctypes.byref(flags))
+    assert flags.value & LWA_COLORKEY
+    assert frame.text.GetBackgroundColour() == TRANSPARENT_KEY
+    # 背景ウィンドウは半透明で、クライアント領域に重なり、Z オーダーで付箋のすぐ後ろ
+    assert frame.backdrop.IsShown()
+    assert frame.backdrop.GetScreenRect() == wx.Rect(frame.ClientToScreen((0, 0)), frame.GetClientSize())
+    assert u.GetWindow(note, 2) == back  # GW_HWNDNEXT
+
+    # 移動・最前面の切替にも追従する
+    frame.Move(frame.GetPosition() + wx.Point(30, 20))
+    assert frame.backdrop.GetScreenRect().GetTopLeft() == frame.ClientToScreen((0, 0))
+    frame.toggle_on_top()
+    assert u.GetWindow(note, 2) == back
+    frame.toggle_on_top()
+
+    frame.toggle_translucent()
+    assert not frame.translucent and frame.backdrop is None
+    assert not ex(note) & WS_EX_LAYERED
+    assert frame.text.GetBackgroundColour() != TRANSPARENT_KEY
+    assert frame.app.translucent == ("m", False)
+
+
+def test_translucent_restored_without_remembering(wxapp, tmp_path):
+    store = LocalStore(tmp_path)
+    store.write("m", "")
+    app = FakeApp(store)
+    f = NoteFrame(app, "m", None, translucent=True)
+    try:
+        assert f.translucent
+        assert not hasattr(app, "translucent")
+    finally:
+        f.Destroy()

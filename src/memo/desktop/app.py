@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import datetime
 import hashlib
 import json
@@ -33,6 +34,11 @@ MIN_SIZE = (120, 60)  # DIP
 CASCADE_MARGIN = 40  # DIP
 CASCADE_STEP = 24  # DIP
 SAVE_DELAY_MS = 700
+# 半透明モードの背景の不透明度 (0-255)。文字は不透明のまま
+BACKDROP_ALPHA = 140
+# 半透明モードで入力欄の背景に塗る色。この色の画素だけを透過させる。
+# 文字のふちはこの色と混ざるので、付箋の地色に近い色にしてにじみを目立たなくする
+TRANSPARENT_KEY = wx.Colour(255, 248, 197)
 # 編集中の付箋が非アクティブになってから、手元の変更を自動 push するまでの時間
 INACTIVE_PUSH_DELAY_MS = 5 * 60 * 1000
 
@@ -41,6 +47,66 @@ GWL_STYLE = -16
 WS_VSCROLL = 0x00200000
 # SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED
 SWP_FRAMECHANGED_ONLY = 0x0001 | 0x0002 | 0x0004 | 0x0020
+
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+WS_EX_LAYERED = 0x00080000
+WS_EX_NOACTIVATE = 0x08000000
+LWA_COLORKEY = 0x1
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+RDW_INVALIDATE, RDW_ERASE, RDW_FRAME, RDW_ALLCHILDREN = 0x1, 0x4, 0x400, 0x80
+WM_WINDOWPOSCHANGED = 0x0047
+WM_NCDESTROY = 0x0082
+WM_CONTEXTMENU = 0x007B
+WM_MOUSEWHEEL = 0x020A
+WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK = 0x0201, 0x0202, 0x0203
+MK_LBUTTON = 0x0001
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+_user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF,
+                                               wintypes.BYTE, wintypes.DWORD]
+_user32.SendMessageW.restype = ctypes.c_ssize_t
+_user32.SendMessageW.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+_user32.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsIconic.argtypes = [wintypes.HWND]
+_user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+
+_SUBCLASSPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, ctypes.c_uint,
+                                   ctypes.c_size_t, ctypes.c_ssize_t,
+                                   ctypes.c_size_t, ctypes.c_size_t)
+_comctl32 = ctypes.WinDLL("comctl32")
+_comctl32.SetWindowSubclass.argtypes = [wintypes.HWND, _SUBCLASSPROC, ctypes.c_size_t,
+                                        ctypes.c_size_t]
+_comctl32.RemoveWindowSubclass.argtypes = [wintypes.HWND, _SUBCLASSPROC, ctypes.c_size_t]
+_comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
+_comctl32.DefSubclassProc.argtypes = [wintypes.HWND, ctypes.c_uint, ctypes.c_size_t,
+                                      ctypes.c_ssize_t]
+
+
+def _ex_style(hwnd: int) -> int:
+    return _user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+
+
+def _set_ex_style(hwnd: int, style: int) -> None:
+    _user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style)
+
+
+def _colorref(c: wx.Colour) -> int:
+    return c.Red() | c.Green() << 8 | c.Blue() << 16
+
+
+def _makelparam(x: int, y: int) -> int:
+    return (y & 0xFFFF) << 16 | (x & 0xFFFF)
 
 
 class ThinScrollBar(wx.Window):
@@ -229,6 +295,7 @@ class Config:
         self.data.setdefault("windows", {})
         self.data.setdefault("open", [])
         self.data.setdefault("not_on_top", [])  # 最前面を解除した slug
+        self.data.setdefault("translucent", [])  # 半透明にした slug
         self._migrate_dpi()
 
     def _migrate_dpi(self) -> None:
@@ -297,13 +364,76 @@ def shift_lines(text: str, start: int, end: int, down: bool) -> tuple[str, int, 
     return "\n".join(lines), start + delta, end + delta
 
 
+class Backdrop(wx.Frame):
+    """半透明モードで付箋の入力欄のすぐ後ろに敷く、半透明の背景ウィンドウ。
+
+    付箋本体は TRANSPARENT_KEY 色の画素だけを完全に透過させ (文字は不透明のまま)、
+    その下にこのウィンドウを置いて半透明の地色を見せる。透過した画素へのクリックは
+    こちらに届くので、付箋の入力欄・スクロールバーへ転送する。
+    """
+
+    def __init__(self, note: "NoteFrame"):
+        super().__init__(None, style=wx.FRAME_NO_TASKBAR | wx.FRAME_TOOL_WINDOW | wx.BORDER_NONE)
+        self.note = note
+        hwnd = self.GetHandle()
+        # クリックされても自分はアクティブにならない (付箋本体をアクティブにする)
+        _set_ex_style(hwnd, _ex_style(hwnd) | WS_EX_NOACTIVATE)
+        self.SetTransparent(BACKDROP_ALPHA)
+        self.SetBackgroundColour(NOTE_BG)
+        self.Bind(wx.EVT_LEFT_DOWN, lambda e: self._forward(e, WM_LBUTTONDOWN, MK_LBUTTON))
+        self.Bind(wx.EVT_LEFT_DCLICK, lambda e: self._forward(e, WM_LBUTTONDBLCLK, MK_LBUTTON))
+        self.Bind(wx.EVT_LEFT_UP, lambda e: self._forward(e, WM_LBUTTONUP, 0))
+        self.Bind(wx.EVT_RIGHT_UP, self._on_right_up)
+        self.Bind(wx.EVT_MOUSEWHEEL, self._on_wheel)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+
+    def set_colour(self, colour: wx.Colour) -> None:
+        if self.GetBackgroundColour() != colour:
+            self.SetBackgroundColour(colour)
+            self.Refresh()
+
+    def _target(self, evt: wx.MouseEvent) -> tuple[wx.Window | None, wx.Point]:
+        pt = self.ClientToScreen(evt.GetPosition())
+        return self.note.child_at(pt), pt
+
+    def _forward(self, evt: wx.MouseEvent, msg: int, mk: int) -> None:
+        target, pt = self._target(evt)
+        if target is None:
+            return
+        if msg != WM_LBUTTONUP and not self.note.IsActive():
+            self.note.Raise()
+        local = target.ScreenToClient(pt)
+        _user32.SendMessageW(target.GetHandle(), msg, mk, _makelparam(local.x, local.y))
+
+    def _on_right_up(self, evt: wx.MouseEvent) -> None:
+        target, pt = self._target(evt)
+        if target is self.note.text:
+            self.note.Raise()
+            target.SetFocus()
+            _user32.SendMessageW(target.GetHandle(), WM_CONTEXTMENU, target.GetHandle(),
+                                 _makelparam(pt.x, pt.y))
+
+    def _on_wheel(self, evt: wx.MouseEvent) -> None:
+        target, pt = self._target(evt)
+        if target is None or evt.GetWheelAxis() != wx.MOUSE_WHEEL_VERTICAL:
+            return
+        wparam = (evt.GetWheelRotation() & 0xFFFF) << 16
+        _user32.SendMessageW(target.GetHandle(), WM_MOUSEWHEEL, wparam, _makelparam(pt.x, pt.y))
+
+    def _on_motion(self, evt: wx.MouseEvent) -> None:
+        target, _ = self._target(evt)
+        cursor = wx.CURSOR_IBEAM if target is self.note.text else wx.CURSOR_ARROW
+        self.SetCursor(wx.Cursor(cursor))
+
+
 class NoteFrame(wx.Frame):
     # タスクバー・Alt+Tab に出すため wx.FRAME_TOOL_WINDOW / wx.FRAME_NO_TASKBAR は使わない
     # (後者は隠しオーナー付きで作られ、Alt+Tab に出なくなる)。
     BASE_STYLE = wx.CAPTION | wx.CLOSE_BOX | wx.RESIZE_BORDER
     ON_TOP_STYLE = wx.STAY_ON_TOP
 
-    def __init__(self, app: "MemoApp", slug: str, rect: list[int] | None, on_top: bool = True):
+    def __init__(self, app: "MemoApp", slug: str, rect: list[int] | None, on_top: bool = True,
+                 translucent: bool = False):
         style = self.BASE_STYLE | (self.ON_TOP_STYLE if on_top else 0)
         super().__init__(None, title=slug, style=style)
         self.app = app
@@ -326,7 +456,12 @@ class NoteFrame(wx.Frame):
         self._save_timer.Stop()
         self._release_timer = wx.CallLater(INACTIVE_PUSH_DELAY_MS, self._release_hold)
         self._release_timer.Stop()
+        self.translucent = False
+        self.backdrop: Backdrop | None = None
+        self._subclass_proc = None
         self._update_look()
+        if translucent:
+            self.set_translucent(True, remember=False)
 
         if rect:
             self.SetRect(wx.Rect(*rect))
@@ -340,17 +475,20 @@ class NoteFrame(wx.Frame):
         self.Bind(wx.EVT_ACTIVATE, self._on_activate)
         self.Bind(wx.EVT_MOVE_END, lambda e: (app.remember_rect(self), e.Skip()))
         self.Bind(wx.EVT_SIZE, lambda e: (app.remember_rect(self), e.Skip()))
+        self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
-        ids = {name: wx.NewIdRef() for name in ("new", "close", "top", "delete", "sync")}
+        ids = {name: wx.NewIdRef() for name in ("new", "close", "top", "delete", "sync", "alpha")}
         self.Bind(wx.EVT_MENU, lambda e: app.new_note_dialog(), id=ids["new"])
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=ids["close"])
         self.Bind(wx.EVT_MENU, lambda e: self.toggle_on_top(), id=ids["top"])
         self.Bind(wx.EVT_MENU, lambda e: app.delete_note(self.slug), id=ids["delete"])
         self.Bind(wx.EVT_MENU, lambda e: self.sync_now(), id=ids["sync"])
+        self.Bind(wx.EVT_MENU, lambda e: self.toggle_translucent(), id=ids["alpha"])
         self.SetAcceleratorTable(wx.AcceleratorTable([
             (wx.ACCEL_CTRL, ord("N"), ids["new"]),
             (wx.ACCEL_CTRL, ord("W"), ids["close"]),
             (wx.ACCEL_CTRL, ord("T"), ids["top"]),
+            (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("T"), ids["alpha"]),
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_DELETE, ids["delete"]),
             (wx.ACCEL_CTRL, ord("S"), ids["sync"]),
         ]))
@@ -535,6 +673,9 @@ class NoteFrame(wx.Frame):
         if self.GetTitle() != title:
             self.SetTitle(title)
         bg = CONFLICT_BG if conflict else NOTE_BG
+        if self.backdrop:
+            self.backdrop.set_colour(bg)
+            bg = TRANSPARENT_KEY
         if self.text.GetBackgroundColour() != bg:
             self.text.SetBackgroundColour(bg)
             self.text.Refresh()
@@ -553,6 +694,90 @@ class NoteFrame(wx.Frame):
         style = style | self.ON_TOP_STYLE if on_top else style & ~self.ON_TOP_STYLE
         self.SetWindowStyleFlag(style)
         self.app.remember_on_top(self.slug, on_top)
+
+    def toggle_translucent(self) -> None:
+        self.set_translucent(not self.translucent)
+
+    def set_translucent(self, translucent: bool, remember: bool = True) -> None:
+        """背景だけを半透明にする (文字は不透明のまま)。
+
+        付箋本体を TRANSPARENT_KEY 色だけ透過するレイヤードウィンドウにし、
+        すぐ後ろに半透明の Backdrop を敷く。
+        """
+        hwnd = self.GetHandle()
+        if translucent and not self.backdrop:
+            self._install_subclass()
+            self.backdrop = Backdrop(self)
+            _set_ex_style(hwnd, _ex_style(hwnd) | WS_EX_LAYERED)
+            _user32.SetLayeredWindowAttributes(hwnd, _colorref(TRANSPARENT_KEY), 255, LWA_COLORKEY)
+            self._update_look()
+            self.place_backdrop()
+        elif not translucent and self.backdrop:
+            self.backdrop.Destroy()
+            self.backdrop = None
+            _set_ex_style(hwnd, _ex_style(hwnd) & ~WS_EX_LAYERED)
+            self._update_look()
+            _user32.RedrawWindow(hwnd, None, None,
+                                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN)
+        self.translucent = translucent
+        if remember:
+            self.app.remember_translucent(self.slug, translucent)
+
+    def child_at(self, pt: wx.Point) -> wx.Window | None:
+        """スクリーン座標 pt の下にある入力欄・スクロールバー。"""
+        for w in (self.text, self.scrollbar):
+            if w.GetScreenRect().Contains(pt):
+                return w
+        return None
+
+    def place_backdrop(self) -> None:
+        """Backdrop を付箋のクライアント領域に重ね、Z オーダーで付箋のすぐ後ろに置く。"""
+        if not self.backdrop:
+            return
+        hwnd, back = self.GetHandle(), self.backdrop.GetHandle()
+        if not _user32.IsWindowVisible(hwnd) or _user32.IsIconic(hwnd):
+            self.backdrop.Hide()
+            return
+        if not self.backdrop.IsShown():
+            self.backdrop.ShowWithoutActivating()
+        rc = wintypes.RECT()
+        _user32.GetClientRect(hwnd, ctypes.byref(rc))
+        origin = wintypes.POINT(0, 0)
+        _user32.ClientToScreen(hwnd, ctypes.byref(origin))
+        topmost = bool(_ex_style(hwnd) & WS_EX_TOPMOST)
+        if bool(_ex_style(back) & WS_EX_TOPMOST) != topmost:
+            _user32.SetWindowPos(back, HWND_TOPMOST if topmost else HWND_NOTOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        _user32.SetWindowPos(back, hwnd, origin.x, origin.y, rc.right, rc.bottom,
+                             SWP_NOACTIVATE)
+
+    def _install_subclass(self) -> None:
+        """付箋の移動・リサイズ・Z オーダー変更・最小化に Backdrop を追従させる。
+
+        wx には WM_WINDOWPOSCHANGED に当たるイベントが無いので、ウィンドウを
+        サブクラス化して拾う。
+        """
+        if self._subclass_proc:
+            return
+
+        def proc(hwnd, msg, wparam, lparam, id_, _ref):
+            try:
+                if msg == WM_WINDOWPOSCHANGED and self.backdrop:
+                    self.place_backdrop()
+                elif msg == WM_NCDESTROY:
+                    _comctl32.RemoveWindowSubclass(hwnd, self._subclass_proc, id_)
+            except Exception:
+                log.exception("backdrop sync failed")
+            return _comctl32.DefSubclassProc(hwnd, msg, wparam, lparam)
+
+        self._subclass_proc = _SUBCLASSPROC(proc)  # GC されないよう保持する
+        _comctl32.SetWindowSubclass(self.GetHandle(), self._subclass_proc, 1, 0)
+
+    def _on_destroy(self, evt: wx.WindowDestroyEvent) -> None:
+        evt.Skip()
+        if evt.GetEventObject() is self and self.backdrop:
+            self.backdrop.Destroy()
+            self.backdrop = None
 
     def refresh_look(self) -> None:
         self._update_look()
@@ -694,6 +919,7 @@ class MemoApp(wx.App):
             slug,
             self.config.data["windows"].get(slug),
             on_top=slug not in self.config.data["not_on_top"],
+            translucent=slug in self.config.data["translucent"],
         )
         self.frames[slug] = frame
         frame.Show()
@@ -776,6 +1002,14 @@ class MemoApp(wx.App):
             lst.append(slug)
         self._config_timer.Start(1000)
 
+    def remember_translucent(self, slug: str, translucent: bool) -> None:
+        lst = self.config.data["translucent"]
+        if not translucent and slug in lst:
+            lst.remove(slug)
+        elif translucent and slug not in lst:
+            lst.append(slug)
+        self._config_timer.Start(1000)
+
     def new_note_dialog(self) -> None:
         prefix = datetime.date.today().strftime("%y%m%d") + "-"
         dlg = wx.TextEntryDialog(
@@ -842,8 +1076,9 @@ class MemoApp(wx.App):
         if slug in self.config.data["open"]:
             self.config.data["open"].remove(slug)
         self.config.data["windows"].pop(slug, None)
-        if slug in self.config.data["not_on_top"]:
-            self.config.data["not_on_top"].remove(slug)
+        for key in ("not_on_top", "translucent"):
+            if slug in self.config.data[key]:
+                self.config.data[key].remove(slug)
         self.config.save()
         self.sync.request()
         self.ensure_window()
