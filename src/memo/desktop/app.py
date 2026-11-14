@@ -355,7 +355,7 @@ class NoteFrame(wx.Frame):
             (wx.ACCEL_CTRL, ord("S"), ids["sync"]),
         ]))
 
-    # --- 行単位の編集: 選択なしの Ctrl+C / Ctrl+X と Alt+↑/↓ ---
+    # --- 行単位の編集: 選択なしの Ctrl+C / Ctrl+X、Alt+↑/↓、Ctrl+Enter ---
     def _on_key_down(self, evt: wx.KeyEvent) -> None:
         key = evt.GetKeyCode()
         mods = evt.GetModifiers()
@@ -367,6 +367,9 @@ class NoteFrame(wx.Frame):
         if mods == wx.MOD_ALT and key in (wx.WXK_UP, wx.WXK_DOWN,
                                           wx.WXK_NUMPAD_UP, wx.WXK_NUMPAD_DOWN):
             self.move_lines(down=key in (wx.WXK_DOWN, wx.WXK_NUMPAD_DOWN))
+            return
+        if mods == wx.MOD_CONTROL and key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.open_line_below()
             return
         evt.Skip()
 
@@ -413,6 +416,19 @@ class NoteFrame(wx.Frame):
             return
         self.text.Remove(to_pos(value, rs), to_pos(value, re_))
         self.text.SetInsertionPoint(to_pos(self.text.GetValue(), target))
+
+    def open_line_below(self) -> None:
+        """キャレットが行のどこにあっても、その行の下に空行を作ってそこへ移る。"""
+        value = self.text.GetValue()
+        to_index, to_pos = self._index_conv(value)
+        idx = to_index(self.text.GetInsertionPoint())
+        e = value.find("\n", idx)
+        if e == -1:
+            e = len(value)
+        self.text.SetInsertionPoint(to_pos(value, e))  # 選択は解除される
+        self.text.WriteText("\n")  # EVT_TEXT 経由で自動保存に乗り、Ctrl+Z でも戻せる
+        new_value = self.text.GetValue()
+        self.text.SetInsertionPoint(to_pos(new_value, e + 1))
 
     def move_lines(self, down: bool) -> None:
         """カーソル行 (選択があればその範囲の行) を 1 行上/下へ入れ替える。"""

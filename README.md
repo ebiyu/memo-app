@@ -44,6 +44,7 @@ uv run memo-desktop --data-dir ./tmp/client-b --interval 5
 | メモを開く・閉じる | トレイメニュー「メモ」 |
 | 付箋を前面に出す (どこからでも) | `Ctrl+Alt+M` |
 | 行を上下に移動 | `Alt+↑` / `Alt+↓` |
+| 現在行の下に新しい行を挿入 | `Ctrl+Enter` |
 | 選択なしで行ごとコピー・カット | `Ctrl+C` / `Ctrl+X` |
 | 最前面の切替 | `Ctrl+T` |
 | この付箋の変更を同期 | `Ctrl+S` |

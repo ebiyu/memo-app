@@ -109,3 +109,28 @@ def test_frame_moves_identical_lines(frame):
     frame.move_lines(down=True)  # 同じ内容の行同士 -> 本文は変わらずキャレットだけ動く
     assert frame.text.GetValue() == "x\nx\ny\n"
     assert caret(frame) == 2
+
+
+# --- Ctrl+Enter: 下に新しい行 ---
+
+def test_open_line_below_from_middle_of_line(frame):
+    set_caret(frame, 3)  # "bb" の 2 文字目
+    frame.open_line_below()
+    assert frame.text.GetValue() == "a\nbb\n\nccc\n"
+    assert caret(frame) == 5
+
+
+def test_open_line_below_on_last_line_without_newline(frame):
+    frame.text.ChangeValue("a\nbb")
+    set_caret(frame, 2)
+    frame.open_line_below()
+    assert frame.text.GetValue() == "a\nbb\n"
+    assert caret(frame) == 5
+
+
+def test_open_line_below_drops_selection(frame):
+    select(frame, 0, 1)  # "a" を選択
+    frame.open_line_below()
+    assert frame.text.GetValue() == "a\n\nbb\nccc\n"
+    assert caret(frame) == 2
+    assert frame.text.GetStringSelection() == ""
