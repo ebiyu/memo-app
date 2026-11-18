@@ -2,7 +2,9 @@
 
 - メモ 1 つ = 小さな通常ウィンドウ 1 枚 (最前面の有無にかかわらずタスクバー・Alt+Tab に出す)
 - 入力欄は Win32 の素の EDIT コントロール。書式は一切持たない
-- タスクトレイに常駐。メニューから新規作成・開く・同期・終了
+- タスクトレイに常駐。メニューから新規作成・開く・終了
+- メモは既定のフォルダの <slug>.txt か、「ファイルを開く」で開いた任意のファイル。
+  Claude Code など外部のツールが書き換えたら取り込み、未保存の入力とは 3-way merge する
 """
 
 from __future__ import annotations
@@ -15,15 +17,13 @@ import json
 import logging
 from pathlib import Path
 
-import httpx
 import wx
 import wx.adv
 
 from memo.core import InvalidSlug, has_conflict_markers, merge3way, validate_slug
 
 from .dpi import scale_factor
-from .store import LocalStore
-from .sync import BackgroundSync, SyncEngine, SyncReport
+from .store import LocalStore, is_file_key
 
 log = logging.getLogger(__name__)
 
@@ -44,8 +44,9 @@ PIN_CAPTION = wx.Colour(255, 234, 140)
 PIN_BORDER = wx.Colour(224, 168, 32)
 PIN_TEXT = wx.Colour(70, 56, 16)
 PIN_MARK = "📌 "
-# 編集中の付箋が非アクティブになってから、手元の変更を自動 push するまでの時間
-INACTIVE_PUSH_DELAY_MS = 5 * 60 * 1000
+# 開いているファイルが外部で変わっていないか見る間隔。書きかけを読まないよう、
+# 変化を見つけてから次の確認でも同じ状態だったときに取り込む
+DISK_POLL_MS = 500
 
 
 GWL_STYLE = -16
@@ -310,9 +311,12 @@ class Config:
             except Exception:
                 log.exception("failed to read config")
         self.data.setdefault("windows", {})
+        # 以下はメモのキー (slug か、開いたファイルの絶対パス) のリスト
         self.data.setdefault("open", [])
-        self.data.setdefault("not_on_top", [])  # 最前面を解除した slug
-        self.data.setdefault("translucent", [])  # 半透明にした slug
+        self.data.setdefault("not_on_top", [])  # 最前面を解除したもの
+        self.data.setdefault("translucent", [])  # 半透明にしたもの
+        self.data.setdefault("files", [])  # 一度開いたファイル (メニューに出す)
+        self.data.pop("server", None)  # サーバー同期をやめる前の設定
         self._migrate_dpi()
 
     def _migrate_dpi(self) -> None:
@@ -449,12 +453,14 @@ class NoteFrame(wx.Frame):
     BASE_STYLE = wx.CAPTION | wx.CLOSE_BOX | wx.RESIZE_BORDER
     ON_TOP_STYLE = wx.STAY_ON_TOP
 
-    def __init__(self, app: "MemoApp", slug: str, rect: list[int] | None, on_top: bool = True,
+    def __init__(self, app: "MemoApp", key: str, rect: list[int] | None, on_top: bool = True,
                  translucent: bool = False):
         style = self.BASE_STYLE | (self.ON_TOP_STYLE if on_top else 0)
-        super().__init__(None, title=slug, style=style)
+        label = app.store.title(key)
+        super().__init__(None, title=label, style=style)
         self.app = app
-        self.slug = slug
+        self.key = key  # slug か、開いたファイルの絶対パス
+        self.label = label  # タイトルに出す名前 (ファイルならファイル名)
         self.SetMinSize(self.FromDIP(wx.Size(*MIN_SIZE)))
 
         self.text = wx.TextCtrl(
@@ -467,12 +473,13 @@ class NoteFrame(wx.Frame):
         sizer.Add(self.scrollbar, 0, wx.EXPAND)
         self.SetSizer(sizer)
 
-        self.disk_text = app.store.read(slug) or ""
+        # disk_text: 最後にディスクと一致した内容 (3-way merge の共通祖先)
+        self._disk_stat = app.store.stat(key)
+        self._pending_stat: tuple[int, int] | None = None
+        self.disk_text = app.store.read(key) or ""
         self.text.ChangeValue(self.disk_text)
-        self._save_timer = wx.CallLater(SAVE_DELAY_MS, self.reconcile)
+        self._save_timer = wx.CallLater(SAVE_DELAY_MS, self.flush)
         self._save_timer.Stop()
-        self._release_timer = wx.CallLater(INACTIVE_PUSH_DELAY_MS, self._release_hold)
-        self._release_timer.Stop()
         self.translucent = False
         self.backdrop: Backdrop | None = None
         self._subclass_proc = None
@@ -495,25 +502,27 @@ class NoteFrame(wx.Frame):
         self.Bind(wx.EVT_SIZE, lambda e: (app.remember_rect(self), e.Skip()))
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
 
-        self._ids = ids = {name: wx.NewIdRef()
-                           for name in ("new", "close", "top", "delete", "sync", "alpha", "quit")}
+        self._ids = ids = {name: wx.NewIdRef() for name in
+                           ("new", "openfile", "close", "top", "delete", "save", "alpha", "quit")}
         self._open_menu: wx.Menu | None = None
         self._open_item_ids: list[wx.WindowIDRef] = []
         self.Bind(wx.EVT_MENU, lambda e: app.quit(), id=ids["quit"])
         self.Bind(wx.EVT_MENU_OPEN, self._on_menu_open)
         self.Bind(wx.EVT_MENU, lambda e: app.new_note_dialog(), id=ids["new"])
+        self.Bind(wx.EVT_MENU, lambda e: app.open_file_dialog(), id=ids["openfile"])
         self.Bind(wx.EVT_MENU, lambda e: self.Close(), id=ids["close"])
         self.Bind(wx.EVT_MENU, lambda e: self.toggle_on_top(), id=ids["top"])
-        self.Bind(wx.EVT_MENU, lambda e: app.delete_note(self.slug), id=ids["delete"])
-        self.Bind(wx.EVT_MENU, lambda e: self.sync_now(), id=ids["sync"])
+        self.Bind(wx.EVT_MENU, lambda e: app.delete_note(self.key), id=ids["delete"])
+        self.Bind(wx.EVT_MENU, lambda e: self.flush(), id=ids["save"])
         self.Bind(wx.EVT_MENU, lambda e: self.toggle_translucent(), id=ids["alpha"])
         self.SetAcceleratorTable(wx.AcceleratorTable([
             (wx.ACCEL_CTRL, ord("N"), ids["new"]),
+            (wx.ACCEL_CTRL, ord("O"), ids["openfile"]),
             (wx.ACCEL_CTRL, ord("W"), ids["close"]),
             (wx.ACCEL_CTRL, ord("T"), ids["top"]),
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, ord("T"), ids["alpha"]),
             (wx.ACCEL_CTRL | wx.ACCEL_SHIFT, wx.WXK_DELETE, ids["delete"]),
-            (wx.ACCEL_CTRL, ord("S"), ids["sync"]),
+            (wx.ACCEL_CTRL, ord("S"), ids["save"]),
         ]))
         self._update_menu_bar()
 
@@ -526,9 +535,12 @@ class NoteFrame(wx.Frame):
         file_menu.Append(ids["new"], "新規メモ…	Ctrl+N")
         self._open_menu = wx.Menu()  # 中身は開くたびに _fill_open_menu で作り直す
         file_menu.AppendSubMenu(self._open_menu, "メモを開く")
-        file_menu.Append(ids["sync"], "今すぐ同期	Ctrl+S")
+        file_menu.Append(ids["openfile"], "ファイルを開く…	Ctrl+O")
+        file_menu.Append(ids["save"], "今すぐ保存	Ctrl+S")
         file_menu.AppendSeparator()
-        file_menu.Append(ids["delete"], "削除…	Ctrl+Shift+Delete")
+        # 開いたファイルは消さず、一覧から外すだけにする
+        file_menu.Append(ids["delete"], ("一覧から外す" if is_file_key(self.key) else "削除…")
+                         + "	Ctrl+Shift+Delete")
         file_menu.AppendSeparator()
         file_menu.Append(ids["close"], "閉じる	Ctrl+W")
         file_menu.Append(ids["quit"], "アプリを終了")
@@ -555,14 +567,17 @@ class NoteFrame(wx.Frame):
         for id_ in self._open_item_ids:
             self.Unbind(wx.EVT_MENU, id=id_)
         self._open_item_ids = []
-        slugs = self.app.store.slugs()
-        for slug in slugs:
+        entries = self.app.menu_entries()
+        for key, label in entries:
+            if key is None:
+                menu.AppendSeparator()
+                continue
             id_ = wx.NewIdRef()
             self._open_item_ids.append(id_)
-            menu.AppendCheckItem(id_, slug).Check(slug in self.app.frames)
+            menu.AppendCheckItem(id_, label).Check(key in self.app.frames)
             # 開いていれば前面に出す (トレイと違い、選んでも閉じない)
-            self.Bind(wx.EVT_MENU, lambda e, s=slug: self.app.open_note(s), id=id_)
-        if not slugs:
+            self.Bind(wx.EVT_MENU, lambda e, k=key: self.app.open_note(k), id=id_)
+        if not entries:
             menu.Append(wx.ID_ANY, "(メモなし)").Enable(False)
 
     def _update_menu_bar(self) -> None:
@@ -668,7 +683,7 @@ class NoteFrame(wx.Frame):
             self.text.SetValue(new_value)  # EVT_TEXT 経由で自動保存に乗る
         self.text.SetSelection(to_pos(new_value, new_start), to_pos(new_value, new_end))
 
-    # --- 保存とローカル変更の取り込み ---
+    # --- 保存と外部変更の取り込み ---
     def _on_text(self, _evt) -> None:
         self._update_look()
         self._save_timer.Start(SAVE_DELAY_MS)
@@ -676,24 +691,29 @@ class NoteFrame(wx.Frame):
     def reconcile(self) -> None:
         """エディタ・ディスク・最後に見たディスク内容の 3 者を突き合わせる。
 
-        同期スレッドがディスクを書き換えていた場合、未保存の入力と 3-way merge する。
+        外部のツール (Claude Code など) がファイルを書き換えていた場合、未保存の入力と
+        3-way merge する。重なる変更はコンフリクトマーカー入りで書き出す。
+        エディタが変わっていなければ書き込まない (外部ツールの「読んだ後に変更された」
+        検知を無駄に起こさないため)。
         """
         if self.IsBeingDeleted():
             return
         store = self.app.store
         wrote = False
         with store.lock:
-            disk = store.read(self.slug)
+            # 読む前の状態を覚える。読んだ後に変わっていれば次のポーリングで拾い直せる
+            stat = store.stat(self.key)
+            disk = store.read(self.key)
             editor = self.text.GetValue()
             if disk is None:
                 if editor == self.disk_text:
-                    # リモートで削除され、手元も未編集 -> 閉じる
-                    wx.CallAfter(self.app.close_note, self.slug)
+                    # 外部で削除され、手元も未編集 -> 閉じる
+                    wx.CallAfter(self.app.close_note, self.key)
                     return
                 disk = self.disk_text  # 編集中なら書き戻して残す
             if disk == self.disk_text:
                 if editor != disk:
-                    store.write(self.slug, editor)
+                    store.write(self.key, editor)
                     self.disk_text = editor
                     wrote = True
             elif editor == self.disk_text:
@@ -701,44 +721,51 @@ class NoteFrame(wx.Frame):
                 self.disk_text = disk
             else:
                 merged = merge3way(self.disk_text, editor, disk).text
-                store.write(self.slug, merged)
+                store.write(self.key, merged)
                 self._replace_text(merged)
                 self.disk_text = merged
                 wrote = True
+            self._disk_stat = store.stat(self.key) if wrote else stat
+            self._pending_stat = None
         self._update_look()
-        if wrote:
-            self.app.sync.request()
 
-    # --- 同期タイミング ---
-    # アクティブな間は手元の変更を push しない (Ctrl+S で即時)。
-    # 非アクティブになって 5 分経ったら push。手元が未変更なら pull は常に自動。
+    def check_disk(self) -> None:
+        """外部での変更を検知したら取り込む (アプリのタイマーから定期的に呼ばれる)。
+
+        書きかけを読まないよう、変化が 2 回続けて同じ状態に落ち着いてから取り込む。
+        """
+        if self.IsBeingDeleted():
+            return
+        stat = self.app.store.stat(self.key)
+        if stat == self._disk_stat:
+            self._pending_stat = None
+            return
+        if stat != self._pending_stat:
+            self._pending_stat = stat
+            return
+        try:
+            self.reconcile()
+        except (OSError, UnicodeDecodeError):
+            log.warning("failed to reload %s", self.key, exc_info=True)
+            self._disk_stat = stat  # 同じ状態のまま何度も失敗しないよう、次の変化まで待つ
+
     def _on_activate(self, evt) -> None:
         evt.Skip()
         if not self or self.IsBeingDeleted():
             return
         if evt.GetActive():
-            self.app.last_active = self.slug
-            self._release_timer.Stop()
-            self.app.engine.hold(self.slug)
+            self.app.last_active = self.key
         else:
             self.flush()
-            self._release_timer.Start(INACTIVE_PUSH_DELAY_MS)
-
-    def _release_hold(self) -> None:
-        if not self:
-            return
-        self.app.engine.release(self.slug)
-        self.app.sync.request()
-
-    def sync_now(self) -> None:
-        self.flush()
-        self.app.engine.force(self.slug)
-        self.app.sync.request()
 
     def flush(self) -> None:
         if self._save_timer.IsRunning():
             self._save_timer.Stop()
-        self.reconcile()
+        try:
+            self.reconcile()
+        except (OSError, UnicodeDecodeError):
+            # 読み書きできなくても閉じる・終了するは止めない (入力は失われる)
+            log.exception("failed to save %s", self.key)
 
     def _replace_text(self, text: str) -> None:
         pos = self.text.GetInsertionPoint()
@@ -747,14 +774,10 @@ class NoteFrame(wx.Frame):
 
     def _update_look(self) -> None:
         text = self.text.GetValue()
-        st = self.app.store.get_state(self.slug)
-        # Ctrl+S でマーカーごとサーバーに保存済み (base にマーカーがあり、未解決の
-        # コンフリクトでもない) なら、意図的に残したものとして警告しない
-        accepted = st is not None and not st.conflict and has_conflict_markers(st.base)
-        conflict = has_conflict_markers(text) and not accepted
-        unsynced = st is None or st.base != text
-        mark = "⚠ " if conflict else "● " if unsynced else ""
-        title = (PIN_MARK if self.on_top else "") + mark + self.slug
+        conflict = has_conflict_markers(text)
+        unsaved = text != self.disk_text
+        mark = "⚠ " if conflict else "● " if unsaved else ""
+        title = (PIN_MARK if self.on_top else "") + mark + self.label
         if self.GetTitle() != title:
             self.SetTitle(title)
         self._update_frame_colours()
@@ -792,7 +815,7 @@ class NoteFrame(wx.Frame):
         self.SetWindowStyleFlag(style)
         self._update_look()
         self._update_menu_bar()
-        self.app.remember_on_top(self.slug, on_top)
+        self.app.remember_on_top(self.key, on_top)
 
     def toggle_translucent(self) -> None:
         self.set_translucent(not self.translucent)
@@ -823,7 +846,7 @@ class NoteFrame(wx.Frame):
         if bar is not None:
             bar.Check(self._ids["alpha"], translucent)
         if remember:
-            self.app.remember_translucent(self.slug, translucent)
+            self.app.remember_translucent(self.key, translucent)
 
     def child_at(self, pt: wx.Point) -> wx.Window | None:
         """スクリーン座標 pt の下にある入力欄・スクロールバー。"""
@@ -886,10 +909,7 @@ class NoteFrame(wx.Frame):
 
     def _on_close(self, evt) -> None:
         self.flush()
-        self._release_timer.Stop()
-        self.app.engine.release(self.slug)  # 閉じたら即 push 対象に戻す
-        self.app.sync.request()
-        self.app.close_note(self.slug)
+        self.app.close_note(self.key)
 
 
 class MemoTaskBarIcon(wx.adv.TaskBarIcon):
@@ -897,30 +917,30 @@ class MemoTaskBarIcon(wx.adv.TaskBarIcon):
         super().__init__()
         self.app = app
         self.icon = make_icon()
-        self.set_status("起動中")
+        self.SetIcon(self.icon, "memo")
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, lambda e: app.new_note_dialog())
         self.Bind(wx.adv.EVT_TASKBAR_LEFT_UP, lambda e: app.raise_all())
-
-    def set_status(self, status: str) -> None:
-        self.SetIcon(self.icon, f"memo — {status}")
 
     def CreatePopupMenu(self):
         app = self.app
         menu = wx.Menu()
         self._item(menu, "新規メモ…", app.new_note_dialog)
+        self._item(menu, "ファイルを開く…", app.open_file_dialog)
 
         open_menu = wx.Menu()
-        slugs = app.store.slugs()
-        for slug in slugs:
-            item = open_menu.AppendCheckItem(wx.ID_ANY, slug)
-            item.Check(slug in app.frames)
-            self.Bind(wx.EVT_MENU, lambda e, s=slug: app.toggle_note(s), item)
-        if not slugs:
+        entries = app.menu_entries()
+        for key, label in entries:
+            if key is None:
+                open_menu.AppendSeparator()
+                continue
+            item = open_menu.AppendCheckItem(wx.ID_ANY, label)
+            item.Check(key in app.frames)
+            self.Bind(wx.EVT_MENU, lambda e, k=key: app.toggle_note(k), item)
+        if not entries:
             open_menu.Append(wx.ID_ANY, "(メモなし)").Enable(False)
         menu.AppendSubMenu(open_menu, "メモ")
 
         menu.AppendSeparator()
-        self._item(menu, "今すぐ同期", app.sync.request)
         self._item(menu, "データフォルダを開く", lambda: wx.LaunchDefaultApplication(str(app.store.root)))
         menu.AppendSeparator()
         self._item(menu, "終了", app.quit)
@@ -932,11 +952,8 @@ class MemoTaskBarIcon(wx.adv.TaskBarIcon):
 
 
 class MemoApp(wx.App):
-    def __init__(self, data_dir: Path, server: str | None, interval: float, token: str | None):
+    def __init__(self, data_dir: Path):
         self._data_dir = data_dir
-        self._server = server
-        self._interval = interval
-        self._token = token
         super().__init__(redirect=False)
 
     def OnInit(self) -> bool:
@@ -951,10 +968,6 @@ class MemoApp(wx.App):
 
         self.store = LocalStore(self._data_dir)
         self.config = Config(self._data_dir / "config.json")
-        server = self._server or self.config.data.get("server") or "http://127.0.0.1:8765"
-        self.config.data["server"] = server
-        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
-        self.http = httpx.Client(base_url=server, timeout=10.0, headers=headers)
 
         self.frames: dict[str, NoteFrame] = {}
         self.last_active: str | None = None
@@ -962,43 +975,32 @@ class MemoApp(wx.App):
         self._config_timer = wx.CallLater(1000, self.config.save)
         self._config_timer.Stop()
 
-        engine = SyncEngine(self.store, self.http, self._on_local_change_threaded)
-        self.engine = engine
-        self.sync = BackgroundSync(engine, interval=self._interval, on_status=self._on_status_threaded)
         self.tray = MemoTaskBarIcon(self)
         self._register_hotkey()
 
-        for slug in list(self.config.data["open"]):
-            if self.store.read(slug) is not None:
-                self.open_note(slug)
+        for key in list(self.config.data["open"]):
+            if self.store.exists(key):
+                self.open_note(key)
         self.ensure_window()
 
-        self.sync.start()
+        # 外部 (Claude Code など) でのファイル変更の監視
+        self._disk_timer = wx.Timer()
+        self._disk_timer.Bind(wx.EVT_TIMER, lambda e: self.check_disk())
+        self._disk_timer.Start(DISK_POLL_MS)
         return True
 
-    # --- 同期スレッドからの通知 ---
-    def _on_local_change_threaded(self, slug: str, _text: str | None) -> None:
-        wx.CallAfter(self._on_local_change, slug)
+    def check_disk(self) -> None:
+        for frame in list(self.frames.values()):
+            frame.check_disk()
 
-    def _on_local_change(self, slug: str) -> None:
-        frame = self.frames.get(slug)
-        if frame:
-            frame.reconcile()
-
-    def _on_status_threaded(self, status: str, report: SyncReport | None) -> None:
-        wx.CallAfter(self._on_status, status, report)
-
-    def _on_status(self, status: str, report: SyncReport | None) -> None:
-        label = {"ok": "同期済み", "offline": "オフライン", "conflict": "コンフリクトあり"}[status]
-        self.tray.set_status(f"{label} ({self.config.data['server']})")
-        for frame in self.frames.values():
-            frame.refresh_look()
-        if report and report.conflicts:
-            for slug in report.conflicts:
-                self.open_note(slug)
-            self.tray.ShowBalloon(
-                "memo", "自動マージできない変更がありました: " + ", ".join(report.conflicts)
-            )
+    def menu_entries(self) -> list[tuple[str | None, str]]:
+        """「メモを開く」の項目 (キー, 表示名)。slug の後に区切り (None) と開いたファイル。"""
+        entries: list[tuple[str | None, str]] = [(s, s) for s in self.store.slugs()]
+        files = [k for k in self.config.data["files"] if self.store.exists(k)]
+        if entries and files:
+            entries.append((None, ""))
+        entries += [(k, f"{Path(k).name}  ({Path(k).parent})") for k in files]
+        return entries
 
     # --- ウィンドウ管理 ---
     def next_cascade_pos(self, win: wx.Window) -> wx.Point:
@@ -1009,41 +1011,71 @@ class MemoApp(wx.App):
         width = win.FromDIP(DEFAULT_SIZE[0])
         return wx.Point(area.right - width - margin - off, area.top + margin + off)
 
-    def open_note(self, slug: str, create: bool = False) -> None:
-        if slug in self.frames:
-            self.frames[slug].Raise()
+    def open_note(self, key: str, create: bool = False) -> None:
+        if key in self.frames:
+            self.frames[key].Raise()
             return
-        if create and self.store.read(slug) is None:
-            self.store.write(slug, "")
-            self.sync.request()
+        if create and not self.store.exists(key):
+            self.store.write(key, "")
+        try:
+            self.store.read(key)  # 読めないファイルでウィンドウを作りかけないよう先に試す
+        except (OSError, UnicodeDecodeError) as e:
+            log.warning("failed to open %s", key, exc_info=True)
+            if isinstance(e, UnicodeDecodeError):
+                msg = "UTF-8 のテキストではないため開けません。"
+            else:
+                msg = str(e)
+            wx.MessageBox(key + "\n\n" + msg, "memo", wx.ICON_WARNING)
+            return
         frame = NoteFrame(
             self,
-            slug,
-            self.config.data["windows"].get(slug),
-            on_top=slug not in self.config.data["not_on_top"],
-            translucent=slug in self.config.data["translucent"],
+            key,
+            self.config.data["windows"].get(key),
+            on_top=key not in self.config.data["not_on_top"],
+            translucent=key in self.config.data["translucent"],
         )
-        self.frames[slug] = frame
+        self.frames[key] = frame
         frame.Show()
-        if slug not in self.config.data["open"]:
-            self.config.data["open"].append(slug)
+        if key not in self.config.data["open"]:
+            self.config.data["open"].append(key)
+        if is_file_key(key) and key not in self.config.data["files"]:
+            self.config.data["files"].append(key)
         self._config_timer.Start(1000)
 
-    def close_note(self, slug: str) -> None:
-        deleted = self.store.read(slug) is None  # リモート削除による自動クローズ
-        if not deleted and list(self.frames) == [slug]:
+    def open_file_dialog(self) -> None:
+        with wx.FileDialog(
+            None, "ファイルを開く",
+            wildcard="テキスト (*.txt;*.md)|*.txt;*.md|すべてのファイル (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        ) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.open_note(self.store.key_for(dlg.GetPath()))
+
+    def close_note(self, key: str) -> None:
+        deleted = not self.store.exists(key)  # 外部での削除による自動クローズ
+        if not deleted and list(self.frames) == [key]:
             # 最後の付箋を閉じたらアプリごと終了する。付箋は「開いたまま」として
             # 記録されるので、次回起動時に再表示される。
             self.quit()
             return
-        frame = self.frames.pop(slug, None)
+        frame = self.frames.pop(key, None)
         if frame:
             self.remember_rect(frame)
             frame.Destroy()
-        if slug in self.config.data["open"]:
-            self.config.data["open"].remove(slug)
+        if deleted:
+            self.forget(key)
+        elif key in self.config.data["open"]:
+            self.config.data["open"].remove(key)
         self._config_timer.Start(1000)
         self.ensure_window()
+
+    def forget(self, key: str) -> None:
+        """メモに関する設定 (開いたファイルの一覧への登録を含む) をすべて消す。"""
+        self.config.data["windows"].pop(key, None)
+        for name in ("open", "not_on_top", "translucent", "files"):
+            if key in self.config.data[name]:
+                self.config.data[name].remove(key)
+        self._config_timer.Start(1000)
 
     def ensure_window(self) -> None:
         """付箋が 1 枚も表示されていなければ、既存メモの先頭 (なければ新規) を開く。"""
@@ -1055,11 +1087,11 @@ class MemoApp(wx.App):
         else:
             self.open_note("scratch", create=True)
 
-    def toggle_note(self, slug: str) -> None:
-        if slug in self.frames:
-            self.frames[slug].Close()
+    def toggle_note(self, key: str) -> None:
+        if key in self.frames:
+            self.frames[key].Close()
         else:
-            self.open_note(slug)
+            self.open_note(key)
 
     def raise_all(self) -> None:
         for f in self.frames.values():
@@ -1093,23 +1125,23 @@ class MemoApp(wx.App):
         if frame.IsIconized():
             return
         r = frame.GetRect()
-        self.config.data["windows"][frame.slug] = [r.x, r.y, r.width, r.height]
+        self.config.data["windows"][frame.key] = [r.x, r.y, r.width, r.height]
         self._config_timer.Start(1000)
 
-    def remember_on_top(self, slug: str, on_top: bool) -> None:
+    def remember_on_top(self, key: str, on_top: bool) -> None:
         lst = self.config.data["not_on_top"]
-        if on_top and slug in lst:
-            lst.remove(slug)
-        elif not on_top and slug not in lst:
-            lst.append(slug)
+        if on_top and key in lst:
+            lst.remove(key)
+        elif not on_top and key not in lst:
+            lst.append(key)
         self._config_timer.Start(1000)
 
-    def remember_translucent(self, slug: str, translucent: bool) -> None:
+    def remember_translucent(self, key: str, translucent: bool) -> None:
         lst = self.config.data["translucent"]
-        if not translucent and slug in lst:
-            lst.remove(slug)
-        elif translucent and slug not in lst:
-            lst.append(slug)
+        if not translucent and key in lst:
+            lst.remove(key)
+        elif translucent and key not in lst:
+            lst.append(key)
         self._config_timer.Start(1000)
 
     def new_note_dialog(self) -> None:
@@ -1164,25 +1196,25 @@ class MemoApp(wx.App):
         finally:
             dlg.Destroy()
 
-    def delete_note(self, slug: str) -> None:
-        if wx.MessageBox(f"メモ「{slug}」を削除しますか？", "memo",
+    def delete_note(self, key: str) -> None:
+        """slug のメモは削除する。開いたファイルは消さず、一覧から外すだけにする。"""
+        if is_file_key(key):
+            question = f"「{Path(key).name}」を一覧から外しますか？ (ファイルは削除しません)"
+        else:
+            question = f"メモ「{key}」を削除しますか？"
+        if wx.MessageBox(question, "memo",
                          wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING) != wx.YES:
             return
-        frame = self.frames.pop(slug, None)
+        frame = self.frames.pop(key, None)
         if frame:
+            if is_file_key(key):
+                frame.flush()
             frame._save_timer.Stop()
-            frame._release_timer.Stop()
             frame.Destroy()
-        self.engine.release(slug)
-        self.store.delete(slug)
-        if slug in self.config.data["open"]:
-            self.config.data["open"].remove(slug)
-        self.config.data["windows"].pop(slug, None)
-        for key in ("not_on_top", "translucent"):
-            if slug in self.config.data[key]:
-                self.config.data[key].remove(slug)
+        if not is_file_key(key):
+            self.store.delete(key)
+        self.forget(key)
         self.config.save()
-        self.sync.request()
         self.ensure_window()
 
     def quit(self) -> None:
@@ -1194,7 +1226,7 @@ class MemoApp(wx.App):
         self.frames.clear()
         self.config.data["open"] = open_slugs
         self.config.save()
-        self.sync.stop()
+        self._disk_timer.Stop()
         self._hotkey_owner.UnregisterHotKey(self._hotkey_id)
         self._hotkey_owner.Destroy()
         self.tray.RemoveIcon()

@@ -10,11 +10,8 @@ def default_data_dir() -> Path:
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="memo-desktop")
-    p.add_argument("--data-dir", type=Path, default=default_data_dir())
-    p.add_argument("--server", help="同期サーバーの URL (既定: config.json か http://127.0.0.1:8765)")
-    p.add_argument("--interval", type=float, default=30.0, help="定期同期の間隔 (秒)")
-    p.add_argument("--token", default=os.environ.get("MEMO_TOKEN"),
-                   help="Bearer トークン (Authelia 連携までの暫定)")
+    p.add_argument("--data-dir", type=Path, default=default_data_dir(),
+                   help="設定と既定のメモ (notes/<slug>.txt) の置き場所")
     args = p.parse_args()
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
@@ -30,7 +27,7 @@ def main() -> None:
 
     from .app import MemoApp
 
-    app = MemoApp(args.data_dir, args.server, args.interval, args.token)
+    app = MemoApp(args.data_dir)
     app.MainLoop()
 
 
